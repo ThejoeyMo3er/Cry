@@ -21,5 +21,4 @@ COPY mainbot_v1.py /app/mainbot.py
 COPY --from=engine-builder /opt/pantegnos/pantegnos /opt/pantegnos/pantegnos
 RUN chmod +x /opt/pantegnos/pantegnos && mkdir -p /app/data
 
-VOLUME ["/app/data"]
 CMD ["python", "/app/mainbot.py"]
