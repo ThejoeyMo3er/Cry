@@ -14,6 +14,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import urlencode, quote
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -29,7 +30,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ProDecryptor - single-file Telegram bot | v0
+# ProDecryptor - single-file Telegram bot | v1
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -535,29 +536,176 @@ KEY_LABEL_RE = re.compile(
 JSON_KEY_RE = re.compile(
     r"(?i)[\"'](?:appKey|configKey|accessKey|subscriptionKey|passKey|passkey|key)[\"']\s*[:=]\s*[\"']([^\"']+)[\"']"
 )
-STANDALONE_KEY_RE = re.compile(
-    r"(?<![A-Za-z0-9])([A-Za-z0-9]{2,}(?:-[A-Za-z0-9]{2,}){2,})(?![A-Za-z0-9])"
-)
+
 
 def extract_links(text):
-    """Extract proxy URIs and configuration keys from text or decrypted output."""
+    """Return ONLY real proxy/config URIs. Plain UUIDs, hosts and random tokens are not links."""
     found, seen = [], set()
-    def add(value, allow_plain=False):
-        value = normalize_link(str(value).strip().strip('\"\'.,;'))
+    for match in URL_RE.findall(text or ""):
+        value = normalize_link(match)
         if not value:
+            continue
+        if value.lower().startswith(URI_SCHEMES) and value not in seen:
+            seen.add(value)
+            found.append(value)
+    return found
+
+
+def extract_labeled_keys(text):
+    """Extract explicitly labelled keys separately; never mix them into the links list."""
+    found, seen = [], set()
+    text = text or ""
+    for key in KEY_LABEL_RE.findall(text):
+        value = str(key).strip().strip('"\'.,;')
+        if value and value not in seen:
+            seen.add(value)
+            found.append(value)
+    for key in JSON_KEY_RE.findall(text):
+        value = str(key).strip().strip('"\'.,;')
+        if value and value not in seen:
+            seen.add(value)
+            found.append(value)
+    return found
+
+
+def strip_ansi(text):
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text or "")
+
+
+def iter_json_values(text):
+    """Yield top-level JSON values embedded in noisy CLI output without re-yielding nested objects."""
+    clean = strip_ansi(text)
+    decoder = json.JSONDecoder()
+    i = 0
+    n = len(clean)
+    while i < n:
+        while i < n and clean[i] not in "[{":
+            i += 1
+        if i >= n:
+            break
+        try:
+            value, end = decoder.raw_decode(clean[i:])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            i += 1
+            continue
+        yield value
+        i += max(1, end)
+
+
+def _boolish(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _first(d, *names):
+    for name in names:
+        if isinstance(d, dict) and name in d and d[name] not in (None, ""):
+            return d[name]
+    return None
+
+
+def build_vless_from_v2ray_profile(profile, remarks=None):
+    """Build a VLESS URI from the structured NPV Tunnel/V2Ray profile emitted by the engine.
+
+    This is intentionally conservative: it only builds a URI when the profile contains
+    the server, port and UUID-like credential needed by this schema.
+    """
+    if not isinstance(profile, dict):
+        return None
+
+    server = _first(profile, "server", "address", "host")
+    port = _first(profile, "serverPort", "port")
+    user_id = _first(profile, "uuid", "id", "password")
+    if not server or not port or not user_id:
+        return None
+
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+
+    # NPV Tunnel's exported V2Ray profile uses password as the VLESS UUID,
+    # and method as the encryption value in the generated URI.
+    query = []
+    method = _first(profile, "method", "encryption")
+    network = _first(profile, "network", "type")
+    security = _first(profile, "security")
+    sni = _first(profile, "sni", "serverName")
+    alpn = _first(profile, "alpn")
+    fingerprint = _first(profile, "fingerPrint", "fingerprint", "fp")
+
+    if method is not None:
+        query.append(("encryption", str(method)))
+    if network is not None:
+        query.append(("type", str(network)))
+    if security is not None:
+        query.append(("security", str(security)))
+    if sni is not None:
+        query.append(("sni", str(sni)))
+    if alpn is not None:
+        query.append(("alpn", str(alpn)))
+    if fingerprint is not None:
+        query.append(("fp", str(fingerprint)))
+
+    insecure = _boolish(_first(profile, "insecure", "allowInsecure"))
+    if insecure:
+        query.append(("insecure", "1"))
+        # This schema's insecure=true is represented by both flags by the
+        # expected VLESS URI format used by the user's NPV Tunnel output.
+        query.append(("allowInsecure", "1"))
+
+    uri = "vless://" + quote(str(user_id), safe="") + "@" + str(server) + ":" + str(port)
+    if query:
+        uri += "?" + urlencode(query)
+
+    remark = remarks
+    if remark is not None and str(remark).strip():
+        uri += "#" + quote(str(remark).strip(), safe="")
+    return uri
+
+
+def extract_structured_uris(text):
+    """Extract ready URIs and reconstruct supported V2Ray/NVP profiles when needed."""
+    found, seen = [], set()
+
+    def add(uri):
+        if not uri:
             return
-        low = value.lower()
-        if low.startswith(URI_SCHEMES) or allow_plain or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+/=-]{5,}", value):
-            if value not in seen:
-                seen.add(value); found.append(value)
-    for link in URL_RE.findall(text or ""):
-        add(link)
-    for key in KEY_LABEL_RE.findall(text or ""):
-        add(key, allow_plain=True)
-    for key in JSON_KEY_RE.findall(text or ""):
-        add(key, allow_plain=True)
-    for key in STANDALONE_KEY_RE.findall(text or ""):
-        add(key, allow_plain=True)
+        uri = normalize_link(uri)
+        if uri.lower().startswith(URI_SCHEMES) and uri not in seen:
+            seen.add(uri)
+            found.append(uri)
+
+    def walk(value, inherited_remarks=None):
+        if isinstance(value, dict):
+            remarks = _first(value, "remarks", "remark", "name", "title") or inherited_remarks
+            # Some exports wrap the actual profile in v2rayProfile.
+            profile = value.get("v2rayProfile")
+            if isinstance(profile, dict):
+                add(build_vless_from_v2ray_profile(profile, remarks))
+                # Do not recurse into this profile again; it would duplicate the same URI.
+                for key, child in value.items():
+                    if key == "v2rayProfile":
+                        continue
+                    if isinstance(child, (dict, list)):
+                        walk(child, remarks)
+                return
+            # Also support a profile object directly.
+            if all(k in value for k in ("server",)):
+                add(build_vless_from_v2ray_profile(value, remarks))
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    walk(child, remarks)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, inherited_remarks)
+
+    for value in iter_json_values(text):
+        walk(value)
+
     return found
 
 def links_codeblock(links):
@@ -955,6 +1103,8 @@ async def handle_text(update, context):
 
     links = extract_links(update.message.text or "")
     if not links:
+        links = extract_structured_uris(update.message.text or "")
+    if not links:
         await update.message.reply_text(
             "❌ لینک قابل شناسایی پیدا نشد.",
             reply_markup=user_menu(),
@@ -967,6 +1117,7 @@ async def handle_text(update, context):
         "raw": update.message.text,
         "links": links,
         "source_files": ["پیام"],
+        "keys": extract_labeled_keys(update.message.text or ""),
     }
     if uid != ADMIN_ID:
         DB.captcha_increment_ops(uid)
@@ -1158,6 +1309,8 @@ async def handle_document(update, context):
             await tg.download_to_drive(custom_path=str(path))
             content = path.read_text(encoding="utf-8", errors="ignore")
             links = extract_links(content)
+            if not links:
+                links = extract_structured_uris(content)
             if links:
                 cleanup_job(uid)
                 USER_JOBS[uid] = {
@@ -1233,6 +1386,8 @@ async def handle_document(update, context):
             raise RuntimeError("خروجی معتبری به دست نیامد.")
 
         links = extract_links(raw)
+        if not links:
+            links = extract_structured_uris(raw)
 
         USER_JOBS[uid] = {
             "directory": str(work_dir),
@@ -1374,6 +1529,7 @@ async def result_callback(update, context):
             "name": "ProDecryptor",
             "count": len(links),
             "files": source_files,
+            "keys": job.get("keys", extract_labeled_keys(raw)),
             "links": [
                 {"protocol": x.split("://", 1)[0].lower(), "link": x}
                 for x in links
@@ -2185,7 +2341,7 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    log.info("Starting ProDecryptor v0")
+    log.info("Starting ProDecryptor v1")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
