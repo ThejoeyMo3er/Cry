@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from collections import deque
 import random
 import secrets
@@ -33,7 +34,7 @@ from telegram.ext import (
 # ProDecryptor - single-file Telegram bot | v1.1.0
 # ============================================================
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_NAME = "ProDecryptor"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -626,6 +627,35 @@ def _first(d, *names):
     return None
 
 
+
+def build_vmess_from_profile(profile, remarks=None):
+    """Build standard VMess URI from V2Ray-style JSON without leaking raw config."""
+    if not isinstance(profile, dict):
+        return None
+    host = _first(profile, "v2rHost", "server", "address", "host", "add")
+    port = _first(profile, "v2rPort", "port")
+    uid = _first(profile, "v2rUserId", "uuid", "id")
+    if not host or not port or not uid:
+        return None
+    obj = {
+        "v": "2",
+        "ps": str(remarks or ""),
+        "add": str(host),
+        "port": str(port),
+        "id": str(uid),
+        "aid": str(_first(profile, "v2rAlterId", "alterId", "aid") or "0"),
+        "scy": str(_first(profile, "v2rVmessSecurity", "security", "scy") or "auto"),
+        "net": str(_first(profile, "v2rNetwork", "network", "net") or "tcp"),
+        "type": str(_first(profile, "type", "headerType") or "none"),
+        "host": str(_first(profile, "v2rHostHeader", "hostHeader") or ""),
+        "path": str(_first(profile, "v2rHttpPath", "path") or ""),
+        "tls": "tls" if str(_first(profile, "v2rTleSecurityType", "security") or "").lower() == "tls" else "",
+        "sni": str(_first(profile, "v2rTlsSni", "sni", "serverName") or ""),
+        "alpn": str(_first(profile, "v2rTleAlpn", "alpn") or ""),
+        "fp": str(_first(profile, "v2rTleFingerprintType", "fingerprint", "fp") or "")
+    }
+    return "vmess://" + base64.urlsafe_b64encode(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()).decode().rstrip("=")
+
 def build_vless_from_v2ray_profile(profile, remarks=None):
     """Conservative NPVT/NVP compatibility reconstruction only.
 
@@ -689,11 +719,13 @@ def extract_structured_uris(text):
                     for uri in URL_RE.findall(child):
                         add(uri)
                 if key == "v2rayProfile" and isinstance(child, dict):
+                    add(build_vmess_from_profile(child, remarks))
                     add(build_vless_from_v2ray_profile(child, remarks))
                     continue
                 if isinstance(child, (dict, list)):
                     walk(child, remarks)
             if "server" in value:
+                add(build_vmess_from_profile(value, remarks))
                 add(build_vless_from_v2ray_profile(value, remarks))
         elif isinstance(value, list):
             for child in value:
@@ -794,7 +826,7 @@ def analyze_engine_output(output_dir, stdout, stderr, input_filename):
         if item["text"] is not None:
             text_parts.append(f"===== {item['name']} =====\n{item['text']}\n")
     raw = "\n".join(text_parts)
-    combined = "\n".join(x for x in (stdout, raw) if x)
+    combined = "\n".join(x for x in (stdout, stderr, raw) if x)
     links = extract_links(combined)
     for uri in extract_structured_uris(combined):
         if uri not in links:
@@ -904,15 +936,8 @@ def result_menu(user_id):
     rows = []
     if job.get("links"):
         rows.append([InlineKeyboardButton("🔗 لینک‌ها", callback_data=f"result:links:{user_id}", style="success")])
-    if job.get("json_values") or job.get("raw"):
-        rows.append([InlineKeyboardButton("📋 JSON / ساختاریافته", callback_data=f"result:json:{user_id}", style="primary")])
-    if job.get("keys"):
-        rows.append([InlineKeyboardButton("🔑 کلیدها", callback_data=f"result:keys:{user_id}", style="primary")])
-    if job.get("raw"):
-        rows.append([InlineKeyboardButton("📄 خروجی متنی", callback_data=f"result:raw:{user_id}", style="primary")])
-    if job.get("files"):
-        rows.append([InlineKeyboardButton("📦 فایل‌های خروجی موتور", callback_data=f"result:files:{user_id}", style="primary")])
-    rows.append([InlineKeyboardButton("🔍 اطلاعات", callback_data=f"result:info:{user_id}", style="primary")])
+    if job.get("json_values") or job.get("raw") or job.get("links"):
+        rows.append([InlineKeyboardButton("📋 JSON", callback_data=f"result:json:{user_id}", style="primary")])
     rows.append([InlineKeyboardButton("🗑 حذف", callback_data=f"result:delete:{user_id}", style="danger")])
     rows.extend(sponsor_rows())
     return InlineKeyboardMarkup(rows)
@@ -1628,7 +1653,7 @@ async def result_callback(update, context):
 
     if action == "links":
         if not links:
-            await q.message.reply_text("❌ هیچ URI قابل استخراجی پیدا نشد. اگر اپ خروجی اختصاصی دارد، از «فایل‌های خروجی موتور» استفاده کن.", reply_markup=result_menu(owner))
+            await q.message.reply_text("❌ هیچ لینک استانداردی پیدا نشد. فقط خروجی قابل تبدیل نمایش داده می‌شود.", reply_markup=result_menu(owner))
             return
         for chunk_items in split_link_chunks(links):
             await q.message.reply_text(links_codeblock(chunk_items), parse_mode=ParseMode.MARKDOWN)
@@ -1646,33 +1671,12 @@ async def result_callback(update, context):
 
     if action == "json":
         data = {
-            "name": APP_NAME,
-            "version": APP_VERSION,
-            "input": job.get("input_filename", source_files[0] if source_files else ""),
-            "output_files": [
-                {"name": x["name"], "size": x["size"], "binary": x["binary"]}
-                for x in files
-            ],
-            "keys": keys,
-            "links": [
-                {"protocol": x.split("://", 1)[0].lower(), "uri": x}
-                for x in links
-            ],
-            "engine_json": json_values,
-            "raw_output": raw,
+            "links": links,
+            "configs": json_values
         }
         content = json.dumps(data, ensure_ascii=False, indent=2)
-        if len(content) <= TELEGRAM_CHUNK:
-            await q.message.reply_text(f"<pre>{esc(content)}</pre>", parse_mode=ParseMode.HTML, reply_markup=result_menu(owner))
-        else:
-            path = Path(tempfile.mkstemp(prefix="pd-", suffix=".json")[1])
-            try:
-                path.write_text(content, encoding="utf-8")
-                with path.open("rb") as f:
-                    await q.message.reply_document(f, filename="prodecryptor-result.json", caption="📋 JSON کامل نتیجه موتور")
-            finally:
-                path.unlink(missing_ok=True)
-            await q.message.reply_text("📋 JSON ارسال شد.", reply_markup=result_menu(owner))
+        for chunk in split_text(content):
+            await q.message.reply_text(f"<pre>{esc(chunk)}</pre>", parse_mode=ParseMode.HTML, reply_markup=result_menu(owner))
         return
 
     if action == "info":
@@ -1700,13 +1704,8 @@ async def result_callback(update, context):
         if not raw:
             await q.message.reply_text("❌ خروجی متنی وجود ندارد.", reply_markup=result_menu(owner))
             return
-        path = Path(tempfile.mkstemp(prefix="pd-", suffix=".txt")[1])
-        try:
-            path.write_text(raw, encoding="utf-8")
-            with path.open("rb") as f:
-                await q.message.reply_document(f, filename="engine-output.txt", caption="📄 خروجی متنی واقعی موتور")
-        finally:
-            path.unlink(missing_ok=True)
+        for chunk in split_text(raw):
+            await q.message.reply_text(f"<pre>{esc(chunk)}</pre>", parse_mode=ParseMode.HTML)
         return
 
     if action == "files":
