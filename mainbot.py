@@ -1,4 +1,8 @@
 import asyncio
+from collections import deque
+import random
+import secrets
+import threading
 import html
 import json
 import logging
@@ -25,7 +29,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ProDecryptor - single-file Telegram bot
+# ProDecryptor - single-file Telegram bot | v20
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -38,8 +42,9 @@ PANTEGNOS_BIN = os.getenv("PANTEGNOS_BIN", "/opt/pantegnos/pantegnos")
 
 DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024
 DEFAULT_PROCESS_TIMEOUT = 90
-MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2")))
+MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "4")))
 TELEGRAM_CHUNK = 3900
+LOG_WINDOW_SECONDS = 300
 
 SUPPORTED_EXTENSIONS = {
     ".slip", ".ehi", ".dark", ".hat", ".npvt", ".npvs", ".nm", ".happ",
@@ -60,9 +65,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("prodecryptor")
 
+class FiveMinuteHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            item = (time.time(), self.format(record))
+            with LOG_LOCK:
+                LOG_BUFFER.append(item)
+                cutoff = time.time() - LOG_WINDOW_SECONDS
+                while LOG_BUFFER and LOG_BUFFER[0][0] < cutoff:
+                    LOG_BUFFER.popleft()
+        except Exception:
+            pass
+
+_log_buffer_handler = FiveMinuteHandler()
+_log_buffer_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+logging.getLogger().addHandler(_log_buffer_handler)
+
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 USER_JOBS = {}
 ADMIN_STATE = {}
+CAPTCHA_PENDING = {}
+LOG_BUFFER = deque()
+LOG_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -97,7 +121,20 @@ class Database:
             total_files INTEGER DEFAULT 0,
             successful_files INTEGER DEFAULT 0,
             failed_files INTEGER DEFAULT 0,
-            total_links INTEGER DEFAULT 0
+            total_links INTEGER DEFAULT 0,
+            captcha_verified INTEGER DEFAULT 0,
+            captcha_ops INTEGER DEFAULT 0,
+            captcha_failures INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS force_join_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL DEFAULT '',
+            username TEXT DEFAULT '',
+            invite_url TEXT DEFAULT '',
+            active INTEGER DEFAULT 1,
+            created_at INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS daily_usage (
@@ -140,6 +177,16 @@ class Database:
         CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
         CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
         """)
+        # Safe migrations for databases created by older ProDecryptor versions.
+        for col, ddl in (
+            ("captcha_verified", "ALTER TABLE users ADD COLUMN captcha_verified INTEGER DEFAULT 0"),
+            ("captcha_ops", "ALTER TABLE users ADD COLUMN captcha_ops INTEGER DEFAULT 0"),
+            ("captcha_failures", "ALTER TABLE users ADD COLUMN captcha_failures INTEGER DEFAULT 0"),
+        ):
+            try:
+                self.conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         self.conn.commit()
 
     def seed(self):
@@ -148,6 +195,8 @@ class Database:
             "maintenance": "0",
             "max_file_size": str(DEFAULT_MAX_FILE_SIZE),
             "process_timeout": str(DEFAULT_PROCESS_TIMEOUT),
+            "captcha_interval": "10",
+            "captcha_max_attempts": "5",
         }
         for k, v in defaults.items():
             self.conn.execute(
@@ -392,6 +441,61 @@ class Database:
             "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
 
+    def set_captcha_verified(self, user_id, verified=True):
+        self.conn.execute("UPDATE users SET captcha_verified=?, captcha_ops=0, captcha_failures=0 WHERE user_id=?", (1 if verified else 0, user_id))
+        self.conn.commit()
+
+    def captcha_state(self, user_id):
+        row = self.get_user(user_id)
+        if not row:
+            return False, 0, 0
+        return bool(row["captcha_verified"]), int(row["captcha_ops"]), int(row["captcha_failures"])
+
+    def captcha_increment_ops(self, user_id):
+        self.conn.execute("UPDATE users SET captcha_ops=captcha_ops+1 WHERE user_id=?", (user_id,))
+        self.conn.commit()
+
+    def captcha_fail(self, user_id):
+        self.conn.execute("UPDATE users SET captcha_failures=captcha_failures+1 WHERE user_id=?", (user_id,))
+        self.conn.commit()
+        return int(self.get_user(user_id)["captcha_failures"])
+
+    def reset_captcha_failures(self, user_id):
+        self.conn.execute("UPDATE users SET captcha_failures=0 WHERE user_id=?", (user_id,))
+        self.conn.commit()
+
+    def channels(self, active_only=True):
+        sql = "SELECT * FROM force_join_channels" + (" WHERE active=1" if active_only else "") + " ORDER BY id"
+        return self.conn.execute(sql).fetchall()
+
+    def add_channel(self, chat_id, title, username, invite_url):
+        cur = self.conn.execute(
+            "INSERT OR REPLACE INTO force_join_channels(chat_id,title,username,invite_url,active,created_at) VALUES(?,?,?,?,1,?)",
+            (str(chat_id), title or "", username or "", invite_url or "", int(time.time())),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def channel(self, cid):
+        return self.conn.execute("SELECT * FROM force_join_channels WHERE id=?", (cid,)).fetchone()
+
+    def toggle_channel(self, cid):
+        self.conn.execute("UPDATE force_join_channels SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (cid,))
+        self.conn.commit()
+
+    def delete_channel(self, cid):
+        self.conn.execute("DELETE FROM force_join_channels WHERE id=?", (cid,))
+        self.conn.commit()
+
+    def snapshot(self, destination):
+        destination = str(destination)
+        dest = sqlite3.connect(destination)
+        try:
+            with self.conn:
+                self.conn.backup(dest)
+        finally:
+            dest.close()
+
     def close(self):
         if self.conn:
             self.conn.close()
@@ -424,42 +528,46 @@ def normalize_link(link):
     return link.strip().rstrip(".,;)]}>'\"")
 
 
+KEY_RE = re.compile(r"(?im)^\s*(?:key|appkey|config[_ -]?key)\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9._:+/=-]{5,})\s*$")
+
 def extract_links(text):
     found = []
     for link in URL_RE.findall(text or ""):
         link = normalize_link(link)
         if link and link.lower().startswith(URI_SCHEMES) and link not in found:
             found.append(link)
+    # Some modern exports intentionally contain a Key/AppKey instead of URI links.
+    for key in KEY_RE.findall(text or ""):
+        key = normalize_link(key)
+        if key and key not in found:
+            found.append(key)
     return found
 
 
 def links_codeblock(links):
-    body = "\n".join(mdv2(x) for x in links)
-    return "```\n" + body + "\n```"
+    # Keep every item on its own line and preserve the code-block/copy affordance.
+    return "```\n" + "\n".join(str(x).replace("`", "\u200b`") for x in links) + "\n```"
+
+
+def split_link_chunks(items, max_chars=TELEGRAM_CHUNK):
+    chunks, current = [], []
+    size = 8
+    for item in items:
+        line = str(item)
+        if current and size + len(line) + 1 > max_chars:
+            chunks.append(current)
+            current, size = [], 8
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        chunks.append(current)
+    return chunks or [[]]
 
 
 def split_text(text, limit=TELEGRAM_CHUNK):
     if len(text) <= limit:
         return [text]
-    result = []
-    current = ""
-    for line in text.splitlines(True):
-        if len(current) + len(line) <= limit:
-            current += line
-        else:
-            if current:
-                result.append(current)
-            current = line
-    if current:
-        result.append(current)
-    final = []
-    for part in result:
-        while len(part) > limit:
-            final.append(part[:limit])
-            part = part[limit:]
-        if part:
-            final.append(part)
-    return final
+    return [text[i:i+limit] for i in range(0, len(text), limit)]
 
 
 def file_size_text(n):
@@ -557,12 +665,77 @@ def admin_menu():
             InlineKeyboardButton("🛠 وضعیت سرویس", callback_data="admin:status", style="success"),
             InlineKeyboardButton("⚙️ تنظیمات", callback_data="admin:settings", style="primary"),
         ],
+        [
+            InlineKeyboardButton("💾 دیتابیس", callback_data="admin:database", style="primary"),
+            InlineKeyboardButton("📜 لاگ ۵ دقیقه اخیر", callback_data="admin:logs", style="primary"),
+        ],
+        [InlineKeyboardButton("🔒 عضویت اجباری", callback_data="admin:channels", style="primary")],
     ])
 
 
 # ============================================================
 # Access / start
 # ============================================================
+
+async def check_force_join(context, user_id):
+    channels = DB.channels(True)
+    missing = []
+    for ch in channels:
+        try:
+            member = await context.bot.get_chat_member(ch["chat_id"], user_id)
+            status = getattr(member, "status", "")
+            if status not in {"creator", "administrator", "member"} and not (status == "restricted" and getattr(member, "is_member", False)):
+                missing.append(ch)
+        except Exception as exc:
+            log.warning("force-join check failed for %s: %s", ch["chat_id"], exc)
+            missing.append(ch)
+    return missing
+
+def join_keyboard(channels):
+    rows = []
+    for ch in channels:
+        url = ch["invite_url"] or (f"https://t.me/{ch['username'].lstrip('@')}" if ch["username"] else "")
+        if url:
+            rows.append([InlineKeyboardButton(f"📢 {ch['title'] or ch['username'] or ch['chat_id']}", url=url, style="primary")])
+    rows.append([InlineKeyboardButton("✅ عضو شدم — بررسی", callback_data="access:check_join", style="success")])
+    return InlineKeyboardMarkup(rows)
+
+async def require_join(update, context):
+    if update.effective_user.id == ADMIN_ID:
+        return True
+    missing = await check_force_join(context, update.effective_user.id)
+    if not missing:
+        return True
+    target = update.callback_query.message if update.callback_query else update.message
+    text = "🔒 <b>برای استفاده از بات باید در کانال‌های زیر عضو باشی.</b>\n\nبعد از عضویت، روی «عضو شدم — بررسی» بزن."
+    await target.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=join_keyboard(missing))
+    return False
+
+def new_captcha():
+    a, b = secrets.randbelow(40) + 1, secrets.randbelow(40) + 1
+    return a, b, a + b
+
+async def ask_captcha(update, context, force=False):
+    uid = update.effective_user.id
+    verified, ops, failures = DB.captcha_state(uid)
+    interval = max(1, int(DB.setting("captcha_interval", "10")))
+    if not force and verified and ops < interval:
+        return True
+    a, b, answer = new_captcha()
+    msg = update.callback_query.message if update.callback_query else update.message
+    sent = await msg.reply_text(f"🤖 <b>برای ادامه، ثابت کن ربات نیستی.</b>\n\n<b>{a} + {b} = ؟</b>\n\nحداکثر ۵ تلاش داری.", parse_mode=ParseMode.HTML)
+    CAPTCHA_PENDING[uid] = {"answer": answer, "question_id": sent.message_id}
+    return False
+
+async def access_guard(update, context, require_captcha=True):
+    if not await guard(update):
+        return False
+    if not await require_join(update, context):
+        return False
+    if require_captcha and update.effective_user.id != ADMIN_ID:
+        if not await ask_captcha(update, context):
+            return False
+    return True
 
 async def guard(update):
     user = update.effective_user
@@ -584,15 +757,14 @@ async def start(update, context):
     if not await guard(update):
         return
 
-    if update.effective_user.id == ADMIN_ID:
-        await update.message.reply_text(
-            "🛡 <b>ProDecryptor</b>\n\nپنل مدیریت کامل آماده است.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_menu(),
-        )
-        return
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        if not await require_join(update, context):
+            return
+        if not await ask_captcha(update, context):
+            return
 
-    if maintenance_on():
+    if maintenance_on() and uid != ADMIN_ID:
         await update.message.reply_text("🛠 بات موقتاً در حال بروزرسانی است.")
         return
 
@@ -621,10 +793,65 @@ async def cancel(update, context):
 # User menu callback
 # ============================================================
 
+async def access_callback(update, context):
+    q = update.callback_query
+    uid = q.from_user.id
+    if q.data == "access:check_join":
+        await q.answer()
+        if not await require_join(update, context):
+            return
+        await q.message.reply_text("✅ عضویت تأیید شد. حالا می‌توانی از بات استفاده کنی.", reply_markup=user_menu())
+
+async def handle_captcha_answer(update, context):
+    uid = update.effective_user.id
+    if not await require_join(update, context):
+        return
+    pending = CAPTCHA_PENDING.pop(uid, None)
+    if not pending:
+        return
+    answer_msg = update.message
+    try:
+        await context.bot.delete_message(uid, pending["question_id"])
+    except Exception:
+        pass
+    try:
+        await answer_msg.delete()
+    except Exception:
+        pass
+    try:
+        answer = int((answer_msg.text or "").strip())
+    except Exception:
+        answer = None
+    if answer == pending["answer"]:
+        DB.set_captcha_verified(uid, True)
+        await context.bot.send_message(uid, "✅ تأیید شد. حالا می‌توانی ادامه بدهی.", reply_markup=user_menu())
+        return
+    failures = DB.captcha_fail(uid)
+    max_attempts = max(1, int(DB.setting("captcha_max_attempts", "5")))
+    if failures >= max_attempts:
+        DB.set_blocked(uid, True)
+        u = DB.get_user(uid)
+        name = " ".join(x for x in [u["first_name"], u["last_name"]] if x)
+        username = "@" + u["username"] if u["username"] else "ندارد"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🟢 رفع مسدودیت", callback_data=f"admin:user:unblock:{uid}", style="success")]])
+        try:
+            await context.bot.send_message(ADMIN_ID, f"⛔ <b>کاربر به‌دلیل ۵ پاسخ اشتباه مسدود شد.</b>\n\n🆔 <code>{uid}</code>\n👤 {esc(name or 'بدون نام')}\n🔹 {esc(username)}", parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception: pass
+        return
+    await context.bot.send_message(uid, f"❌ پاسخ اشتباه بود.\nتلاش باقی‌مانده: <b>{max_attempts-failures}</b>", parse_mode=ParseMode.HTML)
+    # New challenge replaces the old one; old answer/question are already gone.
+    class Dummy: pass
+    dummy = Dummy(); dummy.effective_user = update.effective_user; dummy.message = type("M", (), {"reply_text": lambda self, *a, **k: None})()
+    a,b,ans = new_captcha()
+    sent = await context.bot.send_message(uid, f"🤖 <b>{a} + {b} = ؟</b>", parse_mode=ParseMode.HTML)
+    CAPTCHA_PENDING[uid] = {"answer": ans, "question_id": sent.message_id}
+
 async def menu_callback(update, context):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    if uid != ADMIN_ID and not await require_join(update, context):
+        return
 
     if q.data == "menu:upload":
         await q.message.reply_text(
@@ -666,6 +893,16 @@ async def handle_text(update, context):
 
     uid = update.effective_user.id
 
+    if uid != ADMIN_ID and uid in CAPTCHA_PENDING:
+        await handle_captcha_answer(update, context)
+        return
+
+    if not await require_join(update, context):
+        return
+
+    if uid != ADMIN_ID and not await ask_captcha(update, context):
+        return
+
     if uid == ADMIN_ID and uid in ADMIN_STATE:
         await handle_admin_state(update, context)
         return
@@ -694,6 +931,8 @@ async def handle_text(update, context):
         "links": links,
         "source_files": ["پیام"],
     }
+    if uid != ADMIN_ID:
+        DB.captcha_increment_ops(uid)
 
     await update.message.reply_text(
         f"✅ <b>{len(links)}</b> لینک شناسایی شد.\n\nانتخاب کن:",
@@ -779,6 +1018,20 @@ async def handle_document(update, context):
         return
 
     uid = update.effective_user.id
+
+    if uid == ADMIN_ID and ADMIN_STATE.get(ADMIN_ID, {}).get("type") in {"db_replace", "channel"}:
+        await handle_admin_state(update, context)
+        return
+
+    if uid != ADMIN_ID and uid in CAPTCHA_PENDING:
+        await update.message.reply_text("🤖 ابتدا پاسخ سؤال امنیتی را ارسال کن.")
+        return
+
+    if not await require_join(update, context):
+        return
+
+    if uid != ADMIN_ID and not await ask_captcha(update, context):
+        return
 
     if maintenance_on() and uid != ADMIN_ID:
         await update.message.reply_text("🛠 بات موقتاً در حال بروزرسانی است.")
@@ -901,6 +1154,8 @@ async def handle_document(update, context):
         }
 
         DB.record_success(uid, len(links))
+        if uid != ADMIN_ID:
+            DB.captcha_increment_ops(uid)
         DB.finish_job(job_id, "success", len(links))
 
         await status.edit_text(
@@ -962,6 +1217,8 @@ async def handle_password(update, context):
         USER_JOBS[uid] = job
 
         DB.record_success(uid, len(links))
+        if uid != ADMIN_ID:
+            DB.captcha_increment_ops(uid)
         DB.finish_job(job["job_id"], "success", len(links))
 
         await status.edit_text(
@@ -990,6 +1247,9 @@ async def result_callback(update, context):
     q = update.callback_query
     await q.answer()
 
+    if not await require_join(update, context):
+        return
+
     _, action, owner = q.data.split(":")
     owner = int(owner)
     if q.from_user.id != owner:
@@ -1012,10 +1272,8 @@ async def result_callback(update, context):
                 reply_markup=result_menu(owner),
             )
             return
-        for chunk in split_text(links_codeblock(links)):
-            await q.message.reply_text(
-                chunk, parse_mode=ParseMode.MARKDOWN_V2
-            )
+        for chunk_items in split_link_chunks(links):
+            await q.message.reply_text(links_codeblock(chunk_items), parse_mode=ParseMode.MARKDOWN)
         return
 
     if action == "json":
@@ -1132,6 +1390,7 @@ async def admin_callback(update, context):
         await q.message.reply_text(
             "🤝 <b>ساخت اسپانسر</b>\n\nمرحله 1 از 4\nنام اسپانسر را ارسال کن.",
             parse_mode=ParseMode.HTML,
+            reply_markup=back_button("admin:sponsors"),
         )
     elif d.startswith("admin:sponsor:edit:"):
         sid = int(d.rsplit(":", 1)[1])
@@ -1152,6 +1411,7 @@ async def admin_callback(update, context):
             "مرحله 1 از 4\nنام جدید را ارسال کن.\n"
             "اگر می‌خواهی همان نام بماند، همان نام را ارسال کن.",
             parse_mode=ParseMode.HTML,
+            reply_markup=back_button("admin:sponsors"),
         )
     elif d.startswith("admin:sponsor:toggle:"):
         sid = int(d.rsplit(":", 1)[1])
@@ -1171,6 +1431,31 @@ async def admin_callback(update, context):
         await admin_jobs(q)
     elif d == "admin:settings":
         await admin_settings(q)
+    elif d == "admin:database":
+        await admin_database(q)
+    elif d == "admin:database:backup":
+        await admin_backup(q)
+    elif d == "admin:database:replace":
+        ADMIN_STATE[ADMIN_ID] = {"type": "db_replace"}
+        await q.message.reply_text("💾 فایل دیتابیس را ارسال کن. نام و پسوند فایل مهم نیست؛ فایل باید یک SQLite database معتبر باشد.\nبرای لغو /cancel", reply_markup=back_button("admin:database"))
+    elif d == "admin:logs":
+        await admin_logs(q)
+    elif d == "admin:channels":
+        await admin_channels(q)
+    elif d == "admin:channel:add":
+        ADMIN_STATE[ADMIN_ID] = {"type": "channel", "step": "chat", "data": {}}
+        await q.message.reply_text("🔒 مرحله 1 از 2\nشناسه کانال یا @username را ارسال کن. بات باید در آن کانال ادمین باشد.", reply_markup=back_button("admin:channels"))
+    elif d.startswith("admin:channel:toggle:"):
+        DB.toggle_channel(int(d.rsplit(":",1)[1])); await admin_channels(q)
+    elif d.startswith("admin:channel:delete:"):
+        DB.delete_channel(int(d.rsplit(":",1)[1])); await admin_channels(q)
+    elif d == "admin:captcha":
+        await admin_captcha(q)
+    elif d == "admin:captcha:custom":
+        ADMIN_STATE[ADMIN_ID] = {"type": "captcha_custom"}
+        await q.message.reply_text("✏️ تعداد عملیات را از ۱ تا ۱۰۰۰ ارسال کن.", reply_markup=back_button("admin:captcha"))
+    elif d.startswith("admin:captcha:set:"):
+        DB.set_setting("captcha_interval", d.rsplit(":",1)[1]); await admin_captcha(q)
     elif d == "admin:cancel":
         ADMIN_STATE.pop(ADMIN_ID, None)
         await q.message.reply_text("❎ لغو شد.", reply_markup=admin_menu())
@@ -1205,6 +1490,57 @@ async def admin_callback(update, context):
     elif d.startswith("admin:user:jobs:"):
         await admin_user_jobs(q, int(d.rsplit(":", 1)[1]))
 
+
+def back_button(callback):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=callback, style="primary")]])
+
+async def admin_database(q):
+    exists = DB_PATH.exists()
+    size = file_size_text(DB_PATH.stat().st_size) if exists else "0 KB"
+    await q.message.edit_text("💾 <b>مدیریت دیتابیس</b>\n\n" f"وضعیت: <b>{'آماده' if exists else 'یافت نشد'}</b>\nحجم: <b>{size}</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ بکاپ کامل", callback_data="admin:database:backup", style="success")],[InlineKeyboardButton("♻️ جایگزینی کامل", callback_data="admin:database:replace", style="danger")],[InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")]]))
+
+async def admin_backup(q):
+    tmp = Path(tempfile.mkstemp(prefix="pd-backup-", suffix=".db")[1])
+    try:
+        DB.snapshot(tmp)
+        with tmp.open("rb") as fh:
+            await q.message.reply_document(fh, filename="prodecryptor-backup.db", caption="💾 بکاپ کامل و یکپارچه دیتابیس")
+        await q.message.reply_text("💾 بکاپ ارسال شد.", reply_markup=back_button("admin:database"))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+async def admin_logs(q):
+    with LOG_LOCK:
+        cutoff = time.time() - LOG_WINDOW_SECONDS
+        while LOG_BUFFER and LOG_BUFFER[0][0] < cutoff:
+            LOG_BUFFER.popleft()
+        lines = [x[1] for x in LOG_BUFFER]
+    content = "\n".join(lines) or "در ۵ دقیقه اخیر لاگی ثبت نشده است."
+    if len(content) > 45000:
+        content = content[-45000:]
+    path = Path(tempfile.mkstemp(prefix="pd-logs-", suffix=".txt")[1])
+    try:
+        path.write_text(content, encoding="utf-8")
+        await q.message.reply_document(path.open("rb"), filename="logs-last-5-min.txt", caption="📜 فقط لاگ‌های ۵ دقیقه اخیر")
+    finally:
+        path.unlink(missing_ok=True)
+    await q.message.reply_text("📜 گزارش آماده شد.", reply_markup=back_button("admin:dashboard"))
+
+async def admin_captcha(q):
+    interval = int(DB.setting("captcha_interval", "10"))
+    await q.message.edit_text("🤖 <b>ضد ربات</b>\n\n" f"اولین ورود: سؤال امنیتی اجباری\nبعد از هر: <b>{interval}</b> عملیات موفق\nحداکثر تلاش: <b>5</b>\n\nعدد موردنظر را انتخاب کن:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("5", callback_data="admin:captcha:set:5", style="primary"),InlineKeyboardButton("10", callback_data="admin:captcha:set:10", style="primary"),InlineKeyboardButton("20", callback_data="admin:captcha:set:20", style="primary")],[InlineKeyboardButton("✏️ عدد دلخواه", callback_data="admin:captcha:custom", style="primary")],[InlineKeyboardButton("🔙 تنظیمات", callback_data="admin:settings", style="primary")]]))
+
+async def admin_channels(q):
+    channels = DB.channels(False)
+    lines = ["🔒 <b>عضویت اجباری</b>", ""]
+    rows = []
+    for ch in channels:
+        lines.append(f"{'🟢' if ch['active'] else '⚪'} {esc(ch['title'] or ch['username'] or ch['chat_id'])}")
+        rows.append([InlineKeyboardButton("فعال/غیرفعال", callback_data=f"admin:channel:toggle:{ch['id']}", style="success" if ch['active'] else "primary"), InlineKeyboardButton("🗑", callback_data=f"admin:channel:delete:{ch['id']}", style="danger")])
+    if not channels: lines.append("هنوز کانالی ثبت نشده است.")
+    rows += [[InlineKeyboardButton("➕ افزودن کانال", callback_data="admin:channel:add", style="success")],[InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")]]
+    await q.message.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
 async def admin_dashboard(q):
     s = DB.stats()
@@ -1282,6 +1618,7 @@ async def admin_settings(q):
                 InlineKeyboardButton("60s", callback_data="admin:timeout:60", style="primary"),
                 InlineKeyboardButton("120s", callback_data="admin:timeout:120", style="primary"),
             ],
+            [InlineKeyboardButton("🤖 ضد ربات", callback_data="admin:captcha", style="primary")],
             [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")],
         ]),
     )
@@ -1483,6 +1820,92 @@ async def handle_admin_state(update, context):
     if not state:
         return
 
+    if state["type"] == "db_replace":
+        doc = update.message.document
+        work = Path(tempfile.mkstemp(prefix="pd-db-", suffix=".bin")[1])
+        old_snapshot = DB_PATH.with_name("prodecryptor-before-replace.db")
+        try:
+            if not doc:
+                raise RuntimeError("فایل دیتابیس ارسال نشده است")
+            tg = await doc.get_file()
+            await tg.download_to_drive(custom_path=str(work))
+            with open(work, "rb") as f:
+                header = f.read(16)
+            if header != b"SQLite format 3\x00":
+                raise RuntimeError("فایل SQLite معتبر نیست")
+            test = sqlite3.connect(f"file:{work}?mode=ro", uri=True)
+            try:
+                ok = test.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            finally:
+                test.close()
+            if not ok:
+                raise RuntimeError("بررسی سلامت دیتابیس ناموفق بود")
+
+            # Make a consistent snapshot first; WAL pages are included.
+            DB.snapshot(old_snapshot)
+            DB.conn.close()
+            DB.conn = None
+            for suffix in ("-wal", "-shm"):
+                Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
+            shutil.copy2(work, DB_PATH)
+            try:
+                DB.open()
+            except Exception:
+                # Never leave the bot without its previous working database.
+                for suffix in ("-wal", "-shm"):
+                    Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
+                shutil.copy2(old_snapshot, DB_PATH)
+                DB.open()
+                raise
+            ADMIN_STATE.pop(ADMIN_ID, None)
+            log.warning("Database replaced successfully from uploaded SQLite file: %s", doc.file_name)
+            await update.message.reply_text("✅ دیتابیس با موفقیت و پس از بررسی سلامت جایگزین شد. نسخه قبلی هم برای بازیابی نگه داشته شد.", reply_markup=admin_menu())
+        except Exception as exc:
+            log.exception("database replacement failed")
+            await update.message.reply_text(f"❌ جایگزینی انجام نشد؛ دیتابیس قبلی حفظ شد.\n{esc(str(exc))}", parse_mode=ParseMode.HTML, reply_markup=back_button("admin:database"))
+        finally:
+            work.unlink(missing_ok=True)
+        return
+
+    if state["type"] == "channel":
+        if update.message.document:
+            await update.message.reply_text("❌ این مرحله متن می‌خواهد.")
+            return
+        value = (update.message.text or "").strip()
+        if state["step"] == "chat":
+            try:
+                chat = await context.bot.get_chat(value)
+            except Exception as exc:
+                await update.message.reply_text(f"❌ کانال پیدا نشد یا بات دسترسی ندارد.\n{esc(str(exc))}", parse_mode=ParseMode.HTML)
+                return
+            state["data"].update({"chat_id": chat.id, "title": chat.title or "", "username": chat.username or ""})
+            state["step"] = "invite"
+            await update.message.reply_text("مرحله 2 از 2\nلینک دعوت عمومی/خصوصی کانال را ارسال کن. برای کانال عمومی می‌توانی @username را بفرستی.")
+            return
+        if state["step"] == "invite":
+            invite = value
+            if invite.startswith("@"): invite = "https://t.me/" + invite[1:]
+            if not invite.startswith(("https://t.me/", "http://t.me/")):
+                await update.message.reply_text("❌ لینک باید از نوع t.me باشد.")
+                return
+            d = state["data"]
+            DB.add_channel(d["chat_id"], d["title"], d["username"], invite)
+            ADMIN_STATE.pop(ADMIN_ID, None)
+            await update.message.reply_text("✅ کانال ثبت شد و از این پس عضویت کاربران بررسی می‌شود.", reply_markup=admin_menu())
+            return
+
+    if state["type"] == "captcha_custom":
+        try:
+            value = int((update.message.text or "").strip())
+            if not 1 <= value <= 1000:
+                raise ValueError
+            DB.set_setting("captcha_interval", str(value))
+            ADMIN_STATE.pop(ADMIN_ID, None)
+            await update.message.reply_text(f"✅ ضد ربات روی هر {value} عملیات تنظیم شد.", reply_markup=admin_menu())
+        except Exception:
+            await update.message.reply_text("❌ عدد باید بین ۱ تا ۱۰۰۰ باشد.")
+        return
+
     if state["type"] == "broadcast":
         text = update.message.text or ""
         ADMIN_STATE.pop(ADMIN_ID, None)
@@ -1626,6 +2049,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("cancel", cancel))
 
+    app.add_handler(CallbackQueryHandler(access_callback, pattern=r"^access:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(result_callback, pattern=r"^result:"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
