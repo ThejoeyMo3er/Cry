@@ -48,6 +48,14 @@ TELEGRAM_CHUNK = 3900
 LOG_WINDOW_SECONDS = 300
 ENGINE_LOG_PATH = DATA_DIR / "engine.log"
 
+def reset_engine_log():
+    """Start every bot process with a fresh engine log on persistent storage."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        ENGINE_LOG_PATH.write_text("", encoding="utf-8")
+    except Exception:
+        pass
+
 SUPPORTED_EXTENSIONS = {
     ".slip", ".ehi", ".dark", ".hat", ".npvt", ".npvs", ".nm", ".happ",
 }
@@ -959,7 +967,7 @@ async def help_command(update, context):
         "🔑 <b>کلیدها</b>\nفرمت‌های مختلف کلید مثل <code>Key:</code>، <code>AppKey:</code>، <code>ConfigKey:</code> و کلیدهای مشابه بررسی می‌شوند.\n\n"
         "📋 <b>بعد از پردازش</b>\n«لینک‌ها» فقط موارد قابل استخراج را می‌دهد، «JSON» نتیجه ساختاریافته را می‌دهد، «اطلاعات» خلاصه نتیجه را نشان می‌دهد و «خروجی» فایل کامل پردازش‌شده را می‌فرستد.\n\n"
         "📦 <b>تعداد زیاد</b>\nاگر تعداد لینک‌ها زیاد باشد، خودکار در چند پیام تقسیم می‌شوند و هر پیام جداگانه قابل کپی است.\n\n"
-        "🔐 <b>فایل رمزدار</b>\nدر صورت نیاز، رمز از تو گرفته می‌شود و فایل دوباره بررسی می‌شود.\n\n"
+        "🔐 <b>فایل رمزدار</b>\nاگر فایل به رمز خارجی نیاز داشته باشد، بدون کلید یا رمز لازم قابل باز کردن نیست.\n\n"
         "🆘 <b>دستورها</b>\n<code>/start</code> شروع کار\n<code>/help</code> راهنما\n<code>/cancel</code> لغو عملیات جاری",
         parse_mode=ParseMode.HTML, reply_markup=user_menu())
 
@@ -1385,9 +1393,12 @@ async def handle_document(update, context):
         if not raw.strip():
             raise RuntimeError("خروجی معتبری به دست نیامد.")
 
+        # NPVT may put only UUID/host in the TXT output while printing the
+        # complete structured V2Ray profile to engine stdout. Parse both.
         links = extract_links(raw)
-        if not links:
-            links = extract_structured_uris(raw)
+        for link in extract_structured_uris(stdout):
+            if link not in links:
+                links.append(link)
 
         USER_JOBS[uid] = {
             "directory": str(work_dir),
@@ -1454,6 +1465,9 @@ async def handle_password(update, context):
             raise RuntimeError("empty output")
 
         links = extract_links(raw)
+        for link in extract_structured_uris(stdout):
+            if link not in links:
+                links.append(link)
 
         job["pending_password"] = False
         job["raw"] = raw
@@ -2302,6 +2316,9 @@ async def error_handler(update, context):
 
 
 async def post_init(application):
+    # Persistent storage survives Railway restarts/redeploys, so truncate
+    # the engine-only log whenever a new bot process starts.
+    reset_engine_log()
     DB.open()
     log.info("Database: %s", DB_PATH)
     log.info("Engine: %s", PANTEGNOS_BIN)
