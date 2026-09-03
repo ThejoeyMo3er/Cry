@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ProDecryptor - single-file Telegram bot | v22
+# ProDecryptor - single-file Telegram bot | v23
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -45,6 +45,7 @@ DEFAULT_PROCESS_TIMEOUT = 90
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "4")))
 TELEGRAM_CHUNK = 3900
 LOG_WINDOW_SECONDS = 300
+ENGINE_LOG_PATH = DATA_DIR / "engine.log"
 
 SUPPORTED_EXTENSIONS = {
     ".slip", ".ehi", ".dark", ".hat", ".npvt", ".npvs", ".nm", ".happ",
@@ -684,6 +685,9 @@ def admin_menu():
             InlineKeyboardButton("💾 دیتابیس", callback_data="admin:database", style="primary"),
             InlineKeyboardButton("📜 لاگ ۵ دقیقه اخیر", callback_data="admin:logs", style="primary"),
         ],
+        [
+            InlineKeyboardButton("⚙️ لاگ کامل موتور", callback_data="admin:engine_logs", style="primary"),
+        ],
         [InlineKeyboardButton("🔒 عضویت اجباری", callback_data="admin:channels", style="primary")],
     ])
 
@@ -909,10 +913,13 @@ async def menu_callback(update, context):
     elif q.data == "menu:help":
         await q.message.reply_text(
             "ℹ️ <b>راهنما</b>\n\n"
-            "• فایل یا لینک را ارسال کن.\n"
-            "• اگر فایل رمز داشته باشد، رمز از تو گرفته می‌شود.\n"
+            "• بخش «ارسال فایل»: برای پردازش و رمزگشایی خودکار فایل‌های پشتیبانی‌شده است.\n"
+            "• بخش «ارسال لینک»: برای شناسایی و استخراج لینک‌های کانفیگ از متن است.\n"
+            "• رمز از کاربر دریافت نمی‌شود؛ پردازش به‌صورت غیرتعاملی انجام می‌شود.\n"
+            "• اگر فایل کلید داخلی داشته باشد، خودکار پردازش می‌شود. فایل‌هایی که واقعاً به رمز بیرونی نیاز دارند بدون آن رمز قابل بازشدن نیستند.\n"
             "• بعد از پردازش می‌توانی لینک‌ها، JSON، اطلاعات یا خروجی را بگیری.\n"
-            "• در بخش لینک‌ها هر خط فقط یک لینک است.",
+            "• در بخش لینک‌ها هر خط فقط یک لینک است.\n"
+            "• فرمت‌های فعلی: .slip, .ehi, .dark, .hat, .npvt, .npvs, .nm, .happ.",
             parse_mode=ParseMode.HTML,
             reply_markup=user_menu(),
         )
@@ -937,11 +944,6 @@ async def handle_text(update, context):
 
     if uid == ADMIN_ID and uid in ADMIN_STATE:
         await handle_admin_state(update, context)
-        return
-
-    job = USER_JOBS.get(uid)
-    if job and job.get("pending_password"):
-        await handle_password(update, context)
         return
 
     if uid != ADMIN_ID and not await ask_captcha(update, context):
@@ -981,18 +983,26 @@ async def handle_text(update, context):
 # ============================================================
 
 async def run_engine(input_dir, output_dir, password=""):
-    """Run the engine and return as soon as its output file is written."""
+    """Run the local decoder non-interactively; never ask the Telegram user for a password."""
     output_dir.mkdir(parents=True, exist_ok=True)
     timeout = max(10, int(DB.setting("process_timeout", str(DEFAULT_PROCESS_TIMEOUT))))
     command = [PANTEGNOS_BIN, "-input", str(input_dir), "-output", str(output_dir)]
-    log.info("engine start input=%s output=%s password=%s", input_dir, output_dir, bool(password))
+    job_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    log.info("engine start input=%s output=%s interactive_password=%s", input_dir, output_dir, False)
     async with JOB_SEMAPHORE:
         try:
-            proc = await asyncio.create_subprocess_exec(*command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=str(input_dir.parent))
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(input_dir.parent),
+            )
         except FileNotFoundError as exc:
             log.exception("engine executable not found: %s", PANTEGNOS_BIN)
             raise RuntimeError("موتور پردازش روی سرور در دسترس نیست.") from exc
-        communicate_task = asyncio.create_task(proc.communicate(((password if password else "") + "\n").encode("utf-8")))
+
+        communicate_task = asyncio.create_task(proc.communicate())
         deadline = time.monotonic() + timeout
         output_seen = False
         try:
@@ -1001,34 +1011,60 @@ async def run_engine(input_dir, output_dir, password=""):
                     output_seen = True
                     await asyncio.sleep(0.08)
                     if not communicate_task.done():
-                        try: proc.terminate()
-                        except ProcessLookupError: pass
+                        try:
+                            proc.terminate()
+                        except ProcessLookupError:
+                            pass
                     break
                 if time.monotonic() >= deadline:
                     raise asyncio.TimeoutError
                 await asyncio.sleep(0.05)
+
             if output_seen:
                 try:
                     out, err = await asyncio.wait_for(communicate_task, timeout=2)
                 except asyncio.TimeoutError:
-                    try: proc.kill()
-                    except ProcessLookupError: pass
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
                     out, err = await communicate_task
             else:
                 out, err = await asyncio.wait_for(communicate_task, timeout=max(1, deadline-time.monotonic()))
         except asyncio.TimeoutError as exc:
             if not communicate_task.done():
-                try: proc.kill()
-                except ProcessLookupError: pass
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
                 await communicate_task
             log.error("engine timeout after %ss", timeout)
             raise RuntimeError("زمان پردازش فایل تمام شد.") from exc
+
     stdout = out.decode("utf-8", errors="replace")
     stderr = err.decode("utf-8", errors="replace")
-    log.info("engine finished rc=%s output_seen=%s stdout=%d stderr=%d", proc.returncode, output_seen, len(stdout), len(stderr))
-    if stdout.strip(): log.info("engine stdout: %s", stdout[-12000:])
-    if stderr.strip(): log.warning("engine stderr: %s", stderr[-12000:])
-    return proc.returncode, stdout, stderr
+    rc = proc.returncode
+
+    # Persistent engine-only diagnostics for the administrator.
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with ENGINE_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write("\n" + "=" * 90 + "\n")
+            fh.write(f"[{job_stamp}] rc={rc} output_seen={output_seen}\n")
+            fh.write(f"input={input_dir}\noutput={output_dir}\n")
+            fh.write("--- STDOUT ---\n")
+            fh.write(stdout if stdout else "<empty>\n")
+            fh.write("--- STDERR ---\n")
+            fh.write(stderr if stderr else "<empty>\n")
+    except Exception:
+        log.exception("could not persist engine log")
+
+    log.info("engine finished rc=%s output_seen=%s stdout=%d stderr=%d", rc, output_seen, len(stdout), len(stderr))
+    if stdout.strip():
+        log.info("engine stdout: %s", stdout[-12000:])
+    if stderr.strip():
+        log.warning("engine stderr: %s", stderr[-12000:])
+    return rc, stdout, stderr
 
 def output_text(output_dir):
     files = sorted(p for p in output_dir.rglob("*") if p.is_file())
@@ -1182,25 +1218,8 @@ async def handle_document(update, context):
         rc, stdout, stderr = await run_engine(input_dir, output_dir)
 
         if password_prompt_detected(stdout, stderr):
-            USER_JOBS[uid] = {
-                "directory": str(work_dir),
-                "raw": "",
-                "links": [],
-                "source_files": [filename],
-                "pending_password": True,
-                "input_dir": str(input_dir),
-                "output_dir": str(output_dir),
-                "job_id": job_id,
-                "filename": filename,
-            }
-            DB.finish_job(job_id, "password_required")
-            await status.edit_text(
-                "🔐 <b>این فایل رمز دارد.</b>\n\n"
-                "رمز را در پیام بعدی ارسال کن.\n"
-                "برای لغو /cancel",
-                parse_mode=ParseMode.HTML,
-            )
-            return
+            DB.finish_job(job_id, "failed", 0, "password-protected or interactive input requested")
+            raise RuntimeError("این فایل برای باز شدن به کلید/رمزی نیاز دارد که موتور در خود فایل پیدا نکرده است.")
 
         if rc != 0 or not output_exists(output_dir):
             raise RuntimeError(engine_failure_reason(rc, stdout, stderr, ext))
@@ -1511,6 +1530,8 @@ async def admin_callback(update, context):
         await q.message.reply_text("💾 فایل دیتابیس را ارسال کن. نام و پسوند فایل مهم نیست؛ فایل باید یک SQLite database معتبر باشد.\nبرای لغو /cancel", reply_markup=back_button("admin:database"))
     elif d == "admin:logs":
         await admin_logs(q)
+    elif d == "admin:engine_logs":
+        await admin_engine_logs(q)
     elif d == "admin:channels":
         await admin_channels(q)
     elif d == "admin:channel:add":
@@ -1597,6 +1618,34 @@ async def admin_logs(q):
     finally:
         path.unlink(missing_ok=True)
     await q.message.reply_text("📜 گزارش آماده شد.", reply_markup=back_button("admin:dashboard"))
+
+async def admin_engine_logs(q):
+    """Send the complete persisted stdout/stderr produced by the decoder engine."""
+    if not ENGINE_LOG_PATH.exists():
+        await q.message.reply_text("📜 هنوز لاگ موتور ثبت نشده است.", reply_markup=back_button("admin:dashboard"))
+        return
+    try:
+        size = ENGINE_LOG_PATH.stat().st_size
+        if size > 45 * 1024 * 1024:
+            # Keep the latest 45 MiB so Telegram can receive it reliably.
+            with ENGINE_LOG_PATH.open("rb") as fh:
+                fh.seek(max(0, size - 45 * 1024 * 1024))
+                data = fh.read()
+            tmp = Path(tempfile.mkstemp(prefix="pd-engine-logs-", suffix=".txt")[1])
+            tmp.write_bytes("[بخش انتهایی لاگ موتور]\n\n".encode("utf-8") + data)
+        else:
+            tmp = ENGINE_LOG_PATH
+        try:
+            with tmp.open("rb") as fh:
+                await q.message.reply_document(fh, filename="engine-full.log", caption="⚙️ لاگ کامل موتور: stdout + stderr")
+        finally:
+            if tmp != ENGINE_LOG_PATH:
+                tmp.unlink(missing_ok=True)
+    except Exception as exc:
+        log.exception("sending engine logs failed")
+        await q.message.reply_text(f"❌ ارسال لاگ موتور ناموفق بود: {esc(str(exc)[:500])}", parse_mode=ParseMode.HTML, reply_markup=back_button("admin:dashboard"))
+    else:
+        await q.message.reply_text("⚙️ لاگ کامل موتور ارسال شد.", reply_markup=back_button("admin:dashboard"))
 
 async def admin_captcha(q):
     interval = int(DB.setting("captcha_interval", "10"))
@@ -2132,7 +2181,7 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    log.info("Starting ProDecryptor v22")
+    log.info("Starting ProDecryptor v23")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
