@@ -1,5 +1,5 @@
 services:
-  pantegnos-bot:
+  prodecryptor:
     build:
       context: .
       dockerfile: Dockerfile
@@ -7,19 +7,21 @@ services:
         PANTEGNOS_REPO: https://github.com/FrontierTM/Pantegnos.git
         PANTEGNOS_REF: main
 
-    container_name: pantegnos-telegram-bot
+    container_name: prodecryptor
 
     restart: unless-stopped
 
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
 
+      DATA_DIR: /app/data
       PANTEGNOS_BIN: /opt/pantegnos/pantegnos
 
-      # 50 MB
-      MAX_FILE_SIZE: 52428800
+      MAX_CONCURRENT_JOBS: 2
 
-      # Maximum Pantegnos processing time
-      PROCESS_TIMEOUT: 60
+    volumes:
+      - prodecryptor_data:/app/data
 
-    init: true
+volumes:
+  prodecryptor_data:
+    name: prodecryptor_data
