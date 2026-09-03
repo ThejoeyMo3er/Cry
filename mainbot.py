@@ -30,7 +30,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ProDecryptor - single-file Telegram bot | v1
+# ProDecryptor - single-file Telegram bot | v3
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -63,10 +63,15 @@ SUPPORTED_EXTENSIONS = {
 URI_SCHEMES = (
     "vless://", "vmess://", "trojan://", "ss://", "socks://", "socks5://",
     "hysteria://", "hysteria2://", "hy2://", "tuic://", "wireguard://", "ssh://",
+    "slipnet://", "slipnet-enc://", "slipnet-bundle-enc://",
+    "darktunnel://", "happ://",
 )
 
+# Standard URIs plus client-specific schemes emitted by the decoder engine.
+# nm-* is intentionally open-ended because NetMod has more than one URI variant.
 URL_RE = re.compile(
-    r"(?i)(?:vless|vmess|trojan|ss|socks5?|hysteria2?|hy2|tuic|wireguard|ssh)://[^\s<>\[\]{}\"']+"
+    r"(?i)(?:vless|vmess|trojan|ss|socks5?|hysteria2?|hy2|tuic|wireguard|ssh|"
+    r"slipnet(?:-bundle-enc|-enc)?|darktunnel|happ|nm-[a-z0-9_-]+)://[^\s<>\[\]{}\"']+"
 )
 
 logging.basicConfig(
@@ -801,20 +806,37 @@ def user_menu():
     return InlineKeyboardMarkup(rows)
 
 
+def client_output_label(ext):
+    return {
+        ".slip": "📱 خروجی SlipNet",
+        ".ehi": "📱 خروجی HTTP Injector",
+        ".dark": "📱 خروجی DarkTunnel",
+        ".hat": "📱 خروجی HA Tunnel Plus",
+        ".npvt": "📱 خروجی NPV Tunnel",
+        ".npvs": "📱 خروجی NPV Tunnel",
+        ".nm": "📱 خروجی NetMod",
+        ".happ": "📱 خروجی Happ Proxy",
+    }.get((ext or "").lower(), "📄 خروجی فایل")
+
+
 def result_menu(user_id):
-    rows = [
-        [
+    job = USER_JOBS.get(user_id, {})
+    links = job.get("links", [])
+    raw = job.get("raw", "")
+    ext = job.get("extension", "")
+
+    rows = []
+    if links:
+        rows.append([
             InlineKeyboardButton("🔗 لینک‌ها", callback_data=f"result:links:{user_id}", style="success"),
-            InlineKeyboardButton("📋 JSON", callback_data=f"result:json:{user_id}", style="primary"),
-        ],
-        [
-            InlineKeyboardButton("🔍 اطلاعات", callback_data=f"result:info:{user_id}", style="primary"),
-            InlineKeyboardButton("📄 خروجی", callback_data=f"result:raw:{user_id}", style="primary"),
-        ],
-        [
-            InlineKeyboardButton("🗑 حذف", callback_data=f"result:delete:{user_id}", style="danger"),
-        ],
-    ]
+        ])
+    if raw:
+        rows.append([
+            InlineKeyboardButton(client_output_label(ext), callback_data=f"result:client:{user_id}", style="primary"),
+        ])
+    if not rows:
+        rows.append([InlineKeyboardButton("📄 خروجی فایل", callback_data=f"result:client:{user_id}", style="primary")])
+    rows.append([InlineKeyboardButton("🗑 حذف", callback_data=f"result:delete:{user_id}", style="danger")])
     rows.extend(sponsor_rows())
     return InlineKeyboardMarkup(rows)
 
@@ -1125,6 +1147,7 @@ async def handle_text(update, context):
         "raw": update.message.text,
         "links": links,
         "source_files": ["پیام"],
+        "extension": "",
         "keys": extract_labeled_keys(update.message.text or ""),
     }
     if uid != ADMIN_ID:
@@ -1326,6 +1349,7 @@ async def handle_document(update, context):
                     "raw": content,
                     "links": links,
                     "source_files": [filename],
+                    "extension": ext,
                 }
                 await update.message.reply_text(
                     f"✅ <b>{len(links)}</b> لینک پیدا شد.\n\nانتخاب کن:",
@@ -1405,6 +1429,7 @@ async def handle_document(update, context):
             "raw": raw,
             "links": links,
             "source_files": source_files or [filename],
+            "extension": ext,
             "job_id": job_id,
         }
 
@@ -1473,6 +1498,7 @@ async def handle_password(update, context):
         job["raw"] = raw
         job["links"] = links
         job["source_files"] = source_files
+        job.setdefault("extension", Path(source_files[0]).suffix.lower() if source_files else "")
         USER_JOBS[uid] = job
 
         DB.record_success(uid, len(links))
@@ -1538,66 +1564,20 @@ async def result_callback(update, context):
         await q.message.reply_text("🔗 پایان فهرست لینک‌ها", reply_markup=result_menu(owner))
         return
 
-    if action == "json":
-        data = {
-            "name": "ProDecryptor",
-            "count": len(links),
-            "files": source_files,
-            "keys": job.get("keys", extract_labeled_keys(raw)),
-            "links": [
-                {"protocol": x.split("://", 1)[0].lower(), "link": x}
-                for x in links
-            ],
-        }
-        content = json.dumps(data, ensure_ascii=False, indent=2)
-        if len(content) <= TELEGRAM_CHUNK:
-            await q.message.reply_text(
-                f"<pre>{esc(content)}</pre>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=result_menu(owner),
-            )
-        else:
-            path = Path(tempfile.mkstemp(prefix="pd-", suffix=".json")[1])
-            try:
-                path.write_text(content, encoding="utf-8")
-                with path.open("rb") as f:
-                    await q.message.reply_document(
-                        f, filename="configs.json", caption="📋 JSON آماده است."
-                    )
-                await q.message.reply_text("📋 پایان JSON", reply_markup=result_menu(owner))
-            finally:
-                path.unlink(missing_ok=True)
-        return
-
-    if action == "info":
-        counts = protocol_counts(links)
-        lines = [
-            "🔍 <b>اطلاعات</b>",
-            "",
-            f"📄 فایل‌ها: <b>{len(source_files)}</b>",
-            f"🔗 لینک‌ها: <b>{len(links)}</b>",
-        ]
-        if counts:
-            lines += ["", "📡 <b>پروتکل‌ها:</b>"]
-            for p, c in sorted(counts.items()):
-                lines.append(f"• <code>{esc(p)}</code>: {c}")
-        await q.message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            reply_markup=result_menu(owner),
-        )
-        return
-
-    if action == "raw":
+    if action == "client":
         if not raw:
-            await q.message.reply_text("❌ خروجی خالی است.")
+            await q.message.reply_text("❌ خروجی فایل خالی است.", reply_markup=result_menu(owner))
             return
-        path = Path(tempfile.mkstemp(prefix="pd-", suffix=".txt")[1])
+        ext = job.get("extension", "")
+        label = client_output_label(ext)
+        stem = Path(source_files[0]).stem if source_files else "output"
+        filename = f"{stem}.txt"
+        path = Path(tempfile.mkstemp(prefix="pd-client-", suffix=".txt")[1])
         try:
             path.write_text(raw, encoding="utf-8")
             with path.open("rb") as f:
                 await q.message.reply_document(
-                    f, filename="output.txt", caption="📄 خروجی آماده است."
+                    f, filename=filename, caption=f"{label} آماده است."
                 )
         finally:
             path.unlink(missing_ok=True)
@@ -2358,7 +2338,7 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    log.info("Starting ProDecryptor v1")
+    log.info("Starting ProDecryptor v3")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
