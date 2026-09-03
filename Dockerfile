@@ -38,7 +38,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # نسخه فعلی بات
-COPY mainbot_v2.py /app/mainbot.py
+COPY mainbot.py /app/mainbot.py
 
 # انتقال Engine ساخته‌شده
 COPY --from=engine-builder \
