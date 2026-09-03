@@ -1,8 +1,8 @@
 # ============================================================
-# Stage 1: Build Pantegnos
+# Stage 1 - build the current Pantegnos project automatically
 # ============================================================
 
-FROM golang:1.26.3-bookworm AS pantegnos-builder
+FROM golang:1.26.3-bookworm AS engine-builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
@@ -14,7 +14,7 @@ ARG PANTEGNOS_REPO=https://github.com/FrontierTM/Pantegnos.git
 ARG PANTEGNOS_REF=main
 
 RUN git clone --depth 1 --branch "${PANTEGNOS_REF}" \
-    "${PANTEGNOS_REPO}" Pantegnos
+    "${PANTEGNOS_REPO}" /build/Pantegnos
 
 WORKDIR /build/Pantegnos
 
@@ -26,7 +26,7 @@ RUN go build \
 
 
 # ============================================================
-# Stage 2: Python Telegram Bot
+# Stage 2 - ProDecryptor
 # ============================================================
 
 FROM python:3.12-slim-bookworm
@@ -36,28 +36,19 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Copy Pantegnos binary built in stage 1
-RUN mkdir -p /opt/pantegnos
+RUN mkdir -p /app/data /opt/pantegnos
 
-COPY --from=pantegnos-builder \
-    /build/pantegnos \
-    /opt/pantegnos/pantegnos
-
+COPY --from=engine-builder /build/pantegnos /opt/pantegnos/pantegnos
 RUN chmod +x /opt/pantegnos/pantegnos
 
-# Python dependencies
-COPY requirements.txt .
+COPY requirements.txt /app/requirements.txt
 
-RUN pip install \
-    --no-cache-dir \
-    -r requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Bot source
-COPY mainbot.py .
+COPY mainbot.py /app/mainbot.py
 
-# Runtime configuration
+ENV DATA_DIR=/app/data
 ENV PANTEGNOS_BIN=/opt/pantegnos/pantegnos
-ENV MAX_FILE_SIZE=52428800
-ENV PROCESS_TIMEOUT=60
+ENV MAX_CONCURRENT_JOBS=2
 
-CMD ["python", "mainbot.py"]
+CMD ["python", "/app/mainbot.py"]
