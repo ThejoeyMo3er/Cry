@@ -1,0 +1,25 @@
+services:
+  pantegnos-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PANTEGNOS_REPO: https://github.com/FrontierTM/Pantegnos.git
+        PANTEGNOS_REF: main
+
+    container_name: pantegnos-telegram-bot
+
+    restart: unless-stopped
+
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+
+      PANTEGNOS_BIN: /opt/pantegnos/pantegnos
+
+      # 50 MB
+      MAX_FILE_SIZE: 52428800
+
+      # Maximum Pantegnos processing time
+      PROCESS_TIMEOUT: 60
+
+    init: true
