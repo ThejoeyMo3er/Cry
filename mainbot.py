@@ -30,10 +30,10 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ProDecryptor - single-file Telegram bot | v1.0.0
+# ProDecryptor - single-file Telegram bot | v1.1.0
 # ============================================================
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_NAME = "ProDecryptor"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -59,29 +59,28 @@ def reset_engine_log():
     except Exception:
         pass
 
-SUPPORTED_EXTENSIONS = {
-    ".slip", ".ehi", ".dark", ".hat", ".npvt", ".npvs", ".nm", ".happ",
+# App-format feature registry. These switches control INPUT APP FILES only.
+# Output protocols (VLESS/VMess/Trojan/SS/...) are intentionally separate and are
+# never used to decide whether an app file such as .npvt or .ehi is accepted.
+APP_FORMATS = {
+    ".npvt": {"name": "NPVT", "setting": "app_npvt"},
+    ".npvs": {"name": "NPVS", "setting": "app_npvs"},
+    ".slip": {"name": "SLIP", "setting": "app_slip"},
+    ".dark": {"name": "DarkTunnel", "setting": "app_dark"},
+    ".ehi": {"name": "HTTP Injector", "setting": "app_ehi"},
+    ".hat": {"name": "HA Tunnel Plus", "setting": "app_hat"},
+    ".nm": {"name": "NetMod VPN", "setting": "app_nm"},
+    ".happ": {"name": "HAPP", "setting": "app_happ"},
 }
+SUPPORTED_EXTENSIONS = set(APP_FORMATS)
 
-# Feature switches (controlled from database/admin in future releases)
-# 1 = enabled, 0 = disabled
-FORMAT_FEATURES = {
-    "vless": "feature_vless",
-    "vmess": "feature_vmess",
-    "trojan": "feature_trojan",
-    "ss": "feature_ss",
-    "socks": "feature_socks",
-    "hysteria": "feature_hysteria",
-    "tuic": "feature_tuic",
-    "wireguard": "feature_wireguard",
-    "ssh": "feature_ssh",
+# Output protocols are only for parsing genuine URI outputs.  UUIDs, IPs,
+# hostnames, server names and arbitrary text are never promoted to links.
+OUTPUT_PROTOCOLS = {
+    "vless", "vmess", "trojan", "ss", "socks", "socks5",
+    "hysteria", "hysteria2", "hy2", "tuic", "wireguard", "ssh",
 }
-
-URI_SCHEMES = (
-    "vless://", "vmess://", "trojan://", "ss://", "socks://", "socks5://",
-    "hysteria://", "hysteria2://", "hy2://", "tuic://", "wireguard://", "ssh://",
-)
-
+URI_SCHEMES = tuple(f"{p}://" for p in sorted(OUTPUT_PROTOCOLS, key=len, reverse=True))
 URL_RE = re.compile(
     r"(?i)(?:vless|vmess|trojan|ss|socks5?|hysteria2?|hy2|tuic|wireguard|ssh)://[^\s<>\[\]{}\"']+"
 )
@@ -224,15 +223,14 @@ class Database:
             "process_timeout": str(DEFAULT_PROCESS_TIMEOUT),
             "captcha_interval": "10",
             "captcha_max_attempts": "5",
-            "feature_vless": "1",
-            "feature_vmess": "1",
-            "feature_trojan": "1",
-            "feature_ss": "1",
-            "feature_socks": "1",
-            "feature_hysteria": "1",
-            "feature_tuic": "1",
-            "feature_wireguard": "1",
-            "feature_ssh": "1",
+            "app_npvt": "1",
+            "app_npvs": "1",
+            "app_slip": "1",
+            "app_dark": "1",
+            "app_ehi": "1",
+            "app_hat": "1",
+            "app_nm": "1",
+            "app_happ": "1",
         }
         for k, v in defaults.items():
             self.conn.execute(
@@ -561,7 +559,10 @@ def mdv2(value):
 
 
 def normalize_link(link):
-    return link.strip().rstrip(".,;)]}>'\"")
+    value = str(link or "").strip()
+    # Do not strip URL-safe closing chars blindly; only remove obvious prose
+    # punctuation that cannot be part of these URI outputs.
+    return value.rstrip(".,;)]}>'\"")
 
 
 KEY_LABEL_RE = re.compile(
@@ -572,41 +573,19 @@ JSON_KEY_RE = re.compile(
 )
 
 
-def extract_links(text):
-    """Protocol aware URI extraction. Never treats UUID/IP/hostname as links."""
-    found, seen = [], set()
-    enabled = {}
-    for proto, key in FORMAT_FEATURES.items():
-        enabled[proto] = DB.setting(key, "1") == "1" if "DB" in globals() else True
-
-    for match in URL_RE.findall(text or ""):
-        value = normalize_link(match)
-        if not value or "://" not in value:
-            continue
-        proto = value.split("://", 1)[0].lower()
-        if proto in enabled and not enabled[proto]:
-            continue
-        if proto in FORMAT_FEATURES and value not in seen:
-            seen.add(value)
-            found.append(value)
-    return found
+def app_format_enabled(ext):
+    meta = APP_FORMATS.get(str(ext).lower())
+    if not meta:
+        return False
+    return DB.setting(meta["setting"], "1") == "1"
 
 
-def extract_labeled_keys(text):
-    """Extract explicitly labelled keys separately; never mix them into the links list."""
-    found, seen = [], set()
-    text = text or ""
-    for key in KEY_LABEL_RE.findall(text):
-        value = str(key).strip().strip('"\'.,;')
-        if value and value not in seen:
-            seen.add(value)
-            found.append(value)
-    for key in JSON_KEY_RE.findall(text):
-        value = str(key).strip().strip('"\'.,;')
-        if value and value not in seen:
-            seen.add(value)
-            found.append(value)
-    return found
+def enabled_app_formats():
+    return [ext for ext in APP_FORMATS if app_format_enabled(ext)]
+
+
+def app_format_label(ext):
+    return APP_FORMATS.get(str(ext).lower(), {}).get("name", str(ext).upper().lstrip("."))
 
 
 def strip_ansi(text):
@@ -614,11 +593,10 @@ def strip_ansi(text):
 
 
 def iter_json_values(text):
-    """Yield top-level JSON values embedded in noisy CLI output without re-yielding nested objects."""
+    """Yield complete JSON values embedded in noisy engine stdout/stderr."""
     clean = strip_ansi(text)
     decoder = json.JSONDecoder()
-    i = 0
-    n = len(clean)
+    i, n = 0, len(clean)
     while i < n:
         while i < n and clean[i] not in "[{":
             i += 1
@@ -649,105 +627,192 @@ def _first(d, *names):
 
 
 def build_vless_from_v2ray_profile(profile, remarks=None):
-    """Build a VLESS URI from the structured NPV Tunnel/V2Ray profile emitted by the engine.
+    """Conservative NPVT/NVP compatibility reconstruction only.
 
-    This is intentionally conservative: it only builds a URI when the profile contains
-    the server, port and UUID-like credential needed by this schema.
+    This is deliberately the sole protocol reconstruction in the bot. For all
+    other app-specific output, the engine's own generated URI/file/JSON is
+    preserved rather than guessed.
     """
     if not isinstance(profile, dict):
         return None
-
     server = _first(profile, "server", "address", "host")
     port = _first(profile, "serverPort", "port")
     user_id = _first(profile, "uuid", "id", "password")
     if not server or not port or not user_id:
         return None
-
     try:
         port = int(port)
     except (TypeError, ValueError):
         return None
-
-    # NPV Tunnel's exported V2Ray profile uses password as the VLESS UUID,
-    # and method as the encryption value in the generated URI.
     query = []
-    method = _first(profile, "method", "encryption")
-    network = _first(profile, "network", "type")
-    security = _first(profile, "security")
-    sni = _first(profile, "sni", "serverName")
-    alpn = _first(profile, "alpn")
-    fingerprint = _first(profile, "fingerPrint", "fingerprint", "fp")
-
-    if method is not None:
-        query.append(("encryption", str(method)))
-    if network is not None:
-        query.append(("type", str(network)))
-    if security is not None:
-        query.append(("security", str(security)))
-    if sni is not None:
-        query.append(("sni", str(sni)))
-    if alpn is not None:
-        query.append(("alpn", str(alpn)))
-    if fingerprint is not None:
-        query.append(("fp", str(fingerprint)))
-
-    insecure = _boolish(_first(profile, "insecure", "allowInsecure"))
-    if insecure:
-        query.append(("insecure", "1"))
-        # This schema's insecure=true is represented by both flags by the
-        # expected VLESS URI format used by the user's NPV Tunnel output.
-        query.append(("allowInsecure", "1"))
-
+    for key, names in (
+        ("encryption", ("method", "encryption")),
+        ("type", ("network", "type")),
+        ("security", ("security",)),
+        ("sni", ("sni", "serverName")),
+        ("alpn", ("alpn",)),
+        ("fp", ("fingerPrint", "fingerprint", "fp")),
+    ):
+        value = _first(profile, *names)
+        if value is not None:
+            query.append((key, str(value)))
+    if _boolish(_first(profile, "insecure", "allowInsecure")):
+        query.extend((("insecure", "1"), ("allowInsecure", "1")))
     uri = "vless://" + quote(str(user_id), safe="") + "@" + str(server) + ":" + str(port)
     if query:
         uri += "?" + urlencode(query)
-
-    remark = remarks
-    if remark is not None and str(remark).strip():
-        uri += "#" + quote(str(remark).strip(), safe="")
+    if remarks and str(remarks).strip():
+        uri += "#" + quote(str(remarks).strip(), safe="")
     return uri
 
 
 def extract_structured_uris(text):
-    """Extract ready URIs and reconstruct supported V2Ray/NVP profiles when needed."""
+    """Extract engine-provided URIs and only the known NPVT structured VLESS profile."""
     found, seen = [], set()
 
     def add(uri):
-        if not uri:
-            return
         uri = normalize_link(uri)
-        if uri.lower().startswith(URI_SCHEMES) and uri not in seen:
+        if not uri or "://" not in uri:
+            return
+        proto = uri.split("://", 1)[0].lower()
+        if proto not in OUTPUT_PROTOCOLS or not app_output_protocol_enabled(proto):
+            return
+        if uri not in seen:
             seen.add(uri)
             found.append(uri)
 
     def walk(value, inherited_remarks=None):
         if isinstance(value, dict):
             remarks = _first(value, "remarks", "remark", "name", "title") or inherited_remarks
-            # Some exports wrap the actual profile in v2rayProfile.
-            profile = value.get("v2rayProfile")
-            if isinstance(profile, dict):
-                add(build_vless_from_v2ray_profile(profile, remarks))
-                # Do not recurse into this profile again; it would duplicate the same URI.
-                for key, child in value.items():
-                    if key == "v2rayProfile":
-                        continue
-                    if isinstance(child, (dict, list)):
-                        walk(child, remarks)
-                return
-            # Also support a profile object directly.
-            if all(k in value for k in ("server",)):
-                add(build_vless_from_v2ray_profile(value, remarks))
-            for child in value.values():
+            for key, child in value.items():
+                if isinstance(child, str) and "://" in child:
+                    for uri in URL_RE.findall(child):
+                        add(uri)
+                if key == "v2rayProfile" and isinstance(child, dict):
+                    add(build_vless_from_v2ray_profile(child, remarks))
+                    continue
                 if isinstance(child, (dict, list)):
                     walk(child, remarks)
+            if "server" in value:
+                add(build_vless_from_v2ray_profile(value, remarks))
         elif isinstance(value, list):
             for child in value:
                 walk(child, inherited_remarks)
 
     for value in iter_json_values(text):
         walk(value)
-
     return found
+
+
+def app_output_protocol_enabled(proto):
+    # Output protocol switches are intentionally not app-format switches. Keep
+    # all protocols enabled by default and allow optional DB keys for backwards
+    # compatibility with databases that already contain them.
+    key = f"output_{proto}"
+    if DB.conn is None:
+        return True
+    return DB.setting(key, "1") == "1"
+
+
+def extract_links(text):
+    """Extract only genuine supported URI schemes; never UUID/IP/host text."""
+    found, seen = [], set()
+    for match in URL_RE.findall(strip_ansi(text or "")):
+        value = normalize_link(match)
+        if not value or "://" not in value:
+            continue
+        proto = value.split("://", 1)[0].lower()
+        if proto in OUTPUT_PROTOCOLS and app_output_protocol_enabled(proto) and value not in seen:
+            seen.add(value)
+            found.append(value)
+    return found
+
+
+def extract_labeled_keys(text):
+    found, seen = [], set()
+    text = text or ""
+    for key in KEY_LABEL_RE.findall(text):
+        value = str(key).strip().strip('"\'.,;')
+        if value and value not in seen:
+            seen.add(value); found.append(value)
+    for key in JSON_KEY_RE.findall(text):
+        value = str(key).strip().strip('"\'.,;')
+        if value and value not in seen:
+            seen.add(value); found.append(value)
+    return found
+
+
+def json_objects_from_text(text):
+    values = []
+    for value in iter_json_values(text or ""):
+        values.append(value)
+    return values
+
+
+def is_probably_text(path):
+    try:
+        sample = path.read_bytes()[:4096]
+    except Exception:
+        return False
+    if b"\x00" in sample:
+        return False
+    try:
+        sample.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+def collect_engine_outputs(output_dir):
+    """Collect every generated file without assuming it is a TXT/URI output."""
+    items = []
+    for path in sorted(p for p in output_dir.rglob("*") if p.is_file()):
+        rel = path.relative_to(output_dir).as_posix()
+        size = path.stat().st_size
+        item = {"path": path, "name": rel, "size": size, "text": None, "binary": False}
+        if is_probably_text(path) and size <= 5 * 1024 * 1024:
+            item["text"] = path.read_text(encoding="utf-8", errors="replace")
+        else:
+            item["binary"] = True
+        items.append(item)
+    return items
+
+
+def analyze_engine_output(output_dir, stdout, stderr, input_filename):
+    """Build a lossless-ish result model from ALL engine outputs.
+
+    Priority:
+      1) real URIs emitted by engine files/stdout
+      2) structured JSON URIs / NPVT compatibility reconstruction
+      3) explicit keys kept separate
+      4) every generated engine file exposed for download
+      5) raw text preserved verbatim for client-specific formats
+    """
+    files = collect_engine_outputs(output_dir)
+    text_parts = []
+    for item in files:
+        if item["text"] is not None:
+            text_parts.append(f"===== {item['name']} =====\n{item['text']}\n")
+    raw = "\n".join(text_parts)
+    combined = "\n".join(x for x in (stdout, raw) if x)
+    links = extract_links(combined)
+    for uri in extract_structured_uris(combined):
+        if uri not in links:
+            links.append(uri)
+    keys = extract_labeled_keys(combined)
+    json_values = json_objects_from_text(combined)
+    return {
+        "input_filename": input_filename,
+        "links": links,
+        "keys": keys,
+        "raw": raw,
+        "stdout": stdout or "",
+        "stderr": stderr or "",
+        "files": files,
+        "json_values": json_values,
+        "protocol_counts": protocol_counts(links),
+    }
+
 
 def links_codeblock(links):
     # Keep every item on its own line and preserve the code-block/copy affordance.
@@ -835,19 +900,20 @@ def user_menu():
 
 
 def result_menu(user_id):
-    rows = [
-        [
-            InlineKeyboardButton("🔗 لینک‌ها", callback_data=f"result:links:{user_id}", style="success"),
-            InlineKeyboardButton("📋 JSON", callback_data=f"result:json:{user_id}", style="primary"),
-        ],
-        [
-            InlineKeyboardButton("🔍 اطلاعات", callback_data=f"result:info:{user_id}", style="primary"),
-            InlineKeyboardButton("📄 خروجی", callback_data=f"result:raw:{user_id}", style="primary"),
-        ],
-        [
-            InlineKeyboardButton("🗑 حذف", callback_data=f"result:delete:{user_id}", style="danger"),
-        ],
-    ]
+    job = USER_JOBS.get(user_id, {})
+    rows = []
+    if job.get("links"):
+        rows.append([InlineKeyboardButton("🔗 لینک‌ها", callback_data=f"result:links:{user_id}", style="success")])
+    if job.get("json_values") or job.get("raw"):
+        rows.append([InlineKeyboardButton("📋 JSON / ساختاریافته", callback_data=f"result:json:{user_id}", style="primary")])
+    if job.get("keys"):
+        rows.append([InlineKeyboardButton("🔑 کلیدها", callback_data=f"result:keys:{user_id}", style="primary")])
+    if job.get("raw"):
+        rows.append([InlineKeyboardButton("📄 خروجی متنی", callback_data=f"result:raw:{user_id}", style="primary")])
+    if job.get("files"):
+        rows.append([InlineKeyboardButton("📦 فایل‌های خروجی موتور", callback_data=f"result:files:{user_id}", style="primary")])
+    rows.append([InlineKeyboardButton("🔍 اطلاعات", callback_data=f"result:info:{user_id}", style="primary")])
+    rows.append([InlineKeyboardButton("🗑 حذف", callback_data=f"result:delete:{user_id}", style="danger")])
     rows.extend(sponsor_rows())
     return InlineKeyboardMarkup(rows)
 
@@ -877,6 +943,7 @@ def admin_menu():
         [
             InlineKeyboardButton("⚙️ لاگ کامل موتور", callback_data="admin:engine_logs", style="primary"),
         ],
+        [InlineKeyboardButton("📦 مدیریت فرمت‌های اپ", callback_data="admin:app_formats", style="primary")],
         [InlineKeyboardButton("🔒 عضویت اجباری", callback_data="admin:channels", style="primary")],
     ])
 
@@ -1083,7 +1150,7 @@ async def menu_callback(update, context):
     if q.data == "menu:upload":
         await q.message.reply_text(
             "📤 فایل را مستقیم ارسال کن.\n\n"
-            "فرمت‌های شناخته‌شده شامل NPVT، NPVS، SLIP، EHI، DARK، HAT، NM و HAPP هستند.",
+            f"فرمت‌های فعال: {', '.join(app_format_label(x) for x in enabled_app_formats()) or 'هیچ‌کدام'}.",
             reply_markup=back_button("menu:help"),
         )
     elif q.data == "menu:link":
@@ -1108,7 +1175,7 @@ async def menu_callback(update, context):
             "• اگر فایل کلید داخلی داشته باشد، خودکار پردازش می‌شود. فایل‌هایی که واقعاً به رمز بیرونی نیاز دارند بدون آن رمز قابل بازشدن نیستند.\n"
             "• بعد از پردازش می‌توانی لینک‌ها، JSON، اطلاعات یا خروجی را بگیری.\n"
             "• در بخش لینک‌ها هر خط فقط یک لینک است.\n"
-            "• فرمت‌های فعلی: .slip, .ehi, .dark, .hat, .npvt, .npvs, .nm, .happ.",
+            f"• فرمت‌های فعال: {', '.join(x.lstrip('.') for x in enabled_app_formats()) or 'هیچ‌کدام'}.",
             parse_mode=ParseMode.HTML,
             reply_markup=user_menu(),
         )
@@ -1159,6 +1226,9 @@ async def handle_text(update, context):
         "links": links,
         "source_files": ["پیام"],
         "keys": extract_labeled_keys(update.message.text or ""),
+        "json_values": json_objects_from_text(update.message.text or ""),
+        "files": [],
+        "protocol_counts": protocol_counts(links),
     }
     if uid != ADMIN_ID:
         DB.captcha_increment_ops(uid)
@@ -1174,8 +1244,14 @@ async def handle_text(update, context):
 # Engine
 # ============================================================
 
-async def run_engine(input_dir, output_dir, password=""):
-    """Run the local decoder non-interactively; never ask the Telegram user for a password."""
+async def run_engine(input_dir, output_dir):
+    """Run Pantegnos completely non-interactively and wait for its real exit.
+
+    We intentionally do NOT terminate the process as soon as the first output
+    file appears: some Pantegnos modules can create one file and then continue
+    writing other outputs. Waiting for process completion prevents partial
+    results from being presented to the user.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     timeout = max(10, int(DB.setting("process_timeout", str(DEFAULT_PROCESS_TIMEOUT))))
     command = [PANTEGNOS_BIN, "-input", str(input_dir), "-output", str(output_dir)]
@@ -1193,43 +1269,17 @@ async def run_engine(input_dir, output_dir, password=""):
         except FileNotFoundError as exc:
             log.exception("engine executable not found: %s", PANTEGNOS_BIN)
             raise RuntimeError("موتور پردازش روی سرور در دسترس نیست.") from exc
-
-        communicate_task = asyncio.create_task(proc.communicate())
-        deadline = time.monotonic() + timeout
-        output_seen = False
         try:
-            while not communicate_task.done():
-                if output_exists(output_dir):
-                    output_seen = True
-                    await asyncio.sleep(0.08)
-                    if not communicate_task.done():
-                        try:
-                            proc.terminate()
-                        except ProcessLookupError:
-                            pass
-                    break
-                if time.monotonic() >= deadline:
-                    raise asyncio.TimeoutError
-                await asyncio.sleep(0.05)
-
-            if output_seen:
-                try:
-                    out, err = await asyncio.wait_for(communicate_task, timeout=2)
-                except asyncio.TimeoutError:
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
-                    out, err = await communicate_task
-            else:
-                out, err = await asyncio.wait_for(communicate_task, timeout=max(1, deadline-time.monotonic()))
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError as exc:
-            if not communicate_task.done():
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await communicate_task
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                out, err = await proc.communicate()
+            except Exception:
+                out, err = b"", b""
             log.error("engine timeout after %ss", timeout)
             raise RuntimeError("زمان پردازش فایل تمام شد.") from exc
 
@@ -1237,12 +1287,11 @@ async def run_engine(input_dir, output_dir, password=""):
     stderr = err.decode("utf-8", errors="replace")
     rc = proc.returncode
 
-    # Persistent engine-only diagnostics for the administrator.
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         with ENGINE_LOG_PATH.open("a", encoding="utf-8") as fh:
             fh.write("\n" + "=" * 90 + "\n")
-            fh.write(f"[{job_stamp}] rc={rc} output_seen={output_seen}\n")
+            fh.write(f"[{job_stamp}] rc={rc}\n")
             fh.write(f"input={input_dir}\noutput={output_dir}\n")
             fh.write("--- STDOUT ---\n")
             fh.write(stdout if stdout else "<empty>\n")
@@ -1251,14 +1300,63 @@ async def run_engine(input_dir, output_dir, password=""):
     except Exception:
         log.exception("could not persist engine log")
 
-    log.info("engine finished rc=%s output_seen=%s stdout=%d stderr=%d", rc, output_seen, len(stdout), len(stderr))
+    log.info("engine finished rc=%s stdout=%d stderr=%d output_exists=%s", rc, len(stdout), len(stderr), output_exists(output_dir))
     if stdout.strip():
         log.info("engine stdout: %s", stdout[-12000:])
     if stderr.strip():
         log.warning("engine stderr: %s", stderr[-12000:])
     return rc, stdout, stderr
 
+
 def output_text(output_dir):
+    parts, names = [], []
+    for path in sorted(p for p in output_dir.rglob("*") if p.is_file()):
+        if not is_probably_text(path) or path.stat().st_size > 5 * 1024 * 1024:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        names.append(path.relative_to(output_dir).as_posix())
+        parts.append(f"===== {path.relative_to(output_dir).as_posix()} =====\n{text}\n")
+    return "\n".join(parts), names
+
+
+def output_exists(output_dir):
+    return any(p.is_file() for p in output_dir.rglob("*"))
+
+
+def password_prompt_detected(stdout, stderr):
+    text = (stdout + "\n" + stderr).lower()
+    return any(x in text for x in (
+        "enter password", "enter passkey", "enter passphrase",
+        "password:", "passkey:", "passphrase:",
+        "passphrase required to open this config",
+        "this config is passphrase-protected",
+    ))
+
+
+def engine_failure_reason(rc, stdout, stderr, ext=""):
+    """Return a precise engine-facing reason without asking the Telegram user for a password."""
+    text = strip_ansi((stdout or "") + "\n" + (stderr or "")).strip()
+    low = text.lower()
+    if any(x in low for x in ("incorrect passphrase", "passphrase required", "passphrase-protected", "enter passphrase")):
+        for line in reversed(text.splitlines()):
+            if any(x in line.lower() for x in ("passphrase", "password", "passkey")):
+                return f"🔐 {line.strip()[:900]}"
+        return "🔐 این فایل به Passphrase خارجی نیاز دارد و موتور آن را بدون ورودی تعاملی باز نکرد."
+    if "bad magic" in low or "invalid format" in low or "no matching module" in low:
+        return "ساختار فایل با ماژول‌های فعلی Pantegnos سازگار نیست یا فایل ناقص است."
+    if rc != 0 and text:
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line and not line.startswith("["):
+                return f"خطای موتور: {line[:900]}"
+        return "پردازش فایل توسط موتور با خطا متوقف شد."
+    return "فایل خراب، ناقص یا غیرقابل پردازش است."
+
+
+
     files = sorted(p for p in output_dir.rglob("*") if p.is_file())
     parts = []
     names = []
@@ -1271,37 +1369,6 @@ def output_text(output_dir):
         parts.append(f"===== {path.name} =====\n{text}\n")
     return "\n".join(parts), names
 
-
-def output_exists(output_dir):
-    return any(p.is_file() for p in output_dir.rglob("*"))
-
-
-def password_prompt_detected(stdout, stderr):
-    text = (stdout + "\n" + stderr).lower()
-    return any(x in text for x in (
-        "enter password",
-        "enter passkey",
-        "enter passphrase",
-        "password:",
-        "passkey:",
-        "passphrase:",
-        "passphrase required to open this config",
-        "this config is passphrase-protected",
-    ))
-
-
-
-def engine_failure_reason(rc, stdout, stderr, ext=""):
-    text = (stdout + "\n" + stderr).strip()
-    low = text.lower()
-    if "bad magic" in low or "invalid format" in low or "no matching module" in low:
-        return "ساختار فایل با این فرمت سازگار نیست یا فایل ناقص است."
-    if "incorrect passphrase" in low or "password" in low and "required" in low:
-        return "فایل رمز دارد یا رمز واردشده صحیح نیست."
-    if rc != 0 and text:
-        # Never expose internal engine branding or raw noisy banners to users.
-        return "پردازش فایل با خطای داخلی انجام نشد."
-    return "فایل خراب، ناقص یا غیرقابل پردازش است."
 
 # ============================================================
 # File processing
@@ -1356,8 +1423,13 @@ async def handle_document(update, context):
                 cleanup_job(uid)
                 USER_JOBS[uid] = {
                     "directory": None,
+                    "input_filename": filename,
                     "raw": content,
                     "links": links,
+                    "keys": extract_labeled_keys(content),
+                    "json_values": json_objects_from_text(content),
+                    "files": [],
+                    "protocol_counts": protocol_counts(links),
                     "source_files": [filename],
                 }
                 await update.message.reply_text(
@@ -1370,9 +1442,10 @@ async def handle_document(update, context):
             path.unlink(missing_ok=True)
 
     if ext not in SUPPORTED_EXTENSIONS:
-        await update.message.reply_text(
-            "⚠️ این فرمت در فهرست فرمت‌های قابل پردازش نیست."
-        )
+        await update.message.reply_text("⚠️ این پسوند در موتور فعلی ProDecryptor ثبت نشده است.")
+        return
+    if not app_format_enabled(ext):
+        await update.message.reply_text(f"⛔ فرمت {esc(app_format_label(ext))} فعلاً توسط مدیر غیرفعال شده است.", parse_mode=ParseMode.HTML)
         return
 
     if not DB.consume_daily(uid):
@@ -1411,50 +1484,39 @@ async def handle_document(update, context):
 
         rc, stdout, stderr = await run_engine(input_dir, output_dir)
 
-        if password_prompt_detected(stdout, stderr):
-            DB.finish_job(job_id, "failed", 0, "password-protected or interactive input requested")
-            raise RuntimeError("این فایل برای باز شدن به کلید/رمزی نیاز دارد که موتور در خود فایل پیدا نکرده است.")
-
-        # The decoder may create the output successfully and then be terminated
-        # before its normal 5-second shutdown delay completes. In that case the
-        # OS return code can be non-zero even though a valid output exists.
-        # A real produced output is therefore authoritative for success.
+        # A produced output is authoritative even when the process return code is non-zero.
         if not output_exists(output_dir):
             raise RuntimeError(engine_failure_reason(rc, stdout, stderr, ext))
 
-        raw, source_files = output_text(output_dir)
-        # Parse every engine output source, not only text files.
-        combined_engine_output = stdout + "\n" + raw
-        json_links = extract_structured_uris(combined_engine_output)
-        if json_links:
-            log.info("structured engine links found: %s", len(json_links))
-        if not raw.strip() and not json_links:
-            raise RuntimeError("خروجی معتبری به دست نیامد.")
-
-        # NPVT may put only UUID/host in the TXT output while printing the
-        # complete structured V2Ray profile to engine stdout. Parse both.
-        links = extract_links(raw)
-        for link in json_links if 'json_links' in locals() else extract_structured_uris(stdout):
-            if link not in links:
-                links.append(link)
+        analysis = analyze_engine_output(output_dir, stdout, stderr, filename)
+        if not analysis["raw"].strip() and not analysis["links"] and not analysis["files"]:
+            raise RuntimeError("خروجی معتبری از موتور دریافت نشد.")
+        log.info("engine analysis: files=%d links=%d json=%d keys=%d", len(analysis["files"]), len(analysis["links"]), len(analysis["json_values"]), len(analysis["keys"]))
 
         USER_JOBS[uid] = {
             "directory": str(work_dir),
-            "raw": raw,
-            "links": links,
-            "source_files": source_files or [filename],
+            "input_filename": filename,
+            "raw": analysis["raw"],
+            "stdout": analysis["stdout"],
+            "stderr": analysis["stderr"],
+            "links": analysis["links"],
+            "keys": analysis["keys"],
+            "json_values": analysis["json_values"],
+            "files": analysis["files"],
+            "source_files": [x["name"] for x in analysis["files"]] or [filename],
+            "protocol_counts": analysis["protocol_counts"],
             "job_id": job_id,
         }
 
-        DB.record_success(uid, len(links))
+        DB.record_success(uid, len(analysis["links"]))
         if uid != ADMIN_ID:
             DB.captcha_increment_ops(uid)
-        DB.finish_job(job_id, "success", len(links))
+        DB.finish_job(job_id, "success", len(analysis["links"]))
 
         await status.edit_text(
             "✅ <b>پردازش با موفقیت انجام شد.</b>\n\n"
             f"📄 فایل: <code>{esc(filename)}</code>\n"
-            f"🔗 لینک‌های قابل استخراج: <b>{len(links)}</b>\n\n"
+            f"🔗 URIهای قابل استخراج: <b>{len(analysis['links'])}</b>\n" f"📦 فایل‌های خروجی موتور: <b>{len(analysis['files'])}</b>\n\n"
             "گزینه موردنظر را انتخاب کن:",
             parse_mode=ParseMode.HTML,
             reply_markup=result_menu(uid),
@@ -1547,13 +1609,11 @@ async def result_callback(update, context):
         return
     if not await require_join(update, context):
         return
-
     _, action, owner = q.data.split(":")
     owner = int(owner)
     if q.from_user.id != owner:
         await q.answer("این نتیجه متعلق به شما نیست.", show_alert=True)
         return
-
     job = USER_JOBS.get(owner)
     if not job:
         await q.message.reply_text("⚠️ نتیجه دیگر در دسترس نیست. فایل را دوباره ارسال کن.")
@@ -1561,92 +1621,118 @@ async def result_callback(update, context):
 
     links = job.get("links", [])
     raw = job.get("raw", "")
+    keys = job.get("keys", [])
+    files = job.get("files", [])
+    json_values = job.get("json_values", [])
     source_files = job.get("source_files", [])
 
     if action == "links":
         if not links:
-            await q.message.reply_text(
-                "❌ هیچ لینک قابل استخراجی پیدا نشد.",
-                reply_markup=result_menu(owner),
-            )
+            await q.message.reply_text("❌ هیچ URI قابل استخراجی پیدا نشد. اگر اپ خروجی اختصاصی دارد، از «فایل‌های خروجی موتور» استفاده کن.", reply_markup=result_menu(owner))
             return
-        chunks = split_link_chunks(links)
-        for chunk_items in chunks:
+        for chunk_items in split_link_chunks(links):
             await q.message.reply_text(links_codeblock(chunk_items), parse_mode=ParseMode.MARKDOWN)
-        await q.message.reply_text("🔗 پایان فهرست لینک‌ها", reply_markup=result_menu(owner))
+        await q.message.reply_text("🔗 پایان فهرست URIها", reply_markup=result_menu(owner))
+        return
+
+    if action == "keys":
+        if not keys:
+            await q.message.reply_text("❌ کلید صریحی در خروجی پیدا نشد.", reply_markup=result_menu(owner))
+            return
+        for chunk in split_text("\n".join(f"{i+1}. {x}" for i, x in enumerate(keys))):
+            await q.message.reply_text(f"<pre>{esc(chunk)}</pre>", parse_mode=ParseMode.HTML)
+        await q.message.reply_text("🔑 پایان کلیدها", reply_markup=result_menu(owner))
         return
 
     if action == "json":
         data = {
-            "name": "ProDecryptor",
-            "count": len(links),
-            "files": source_files,
-            "keys": job.get("keys", extract_labeled_keys(raw)),
+            "name": APP_NAME,
+            "version": APP_VERSION,
+            "input": job.get("input_filename", source_files[0] if source_files else ""),
+            "output_files": [
+                {"name": x["name"], "size": x["size"], "binary": x["binary"]}
+                for x in files
+            ],
+            "keys": keys,
             "links": [
-                {"protocol": x.split("://", 1)[0].lower(), "link": x}
+                {"protocol": x.split("://", 1)[0].lower(), "uri": x}
                 for x in links
             ],
+            "engine_json": json_values,
+            "raw_output": raw,
         }
         content = json.dumps(data, ensure_ascii=False, indent=2)
         if len(content) <= TELEGRAM_CHUNK:
-            await q.message.reply_text(
-                f"<pre>{esc(content)}</pre>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=result_menu(owner),
-            )
+            await q.message.reply_text(f"<pre>{esc(content)}</pre>", parse_mode=ParseMode.HTML, reply_markup=result_menu(owner))
         else:
             path = Path(tempfile.mkstemp(prefix="pd-", suffix=".json")[1])
             try:
                 path.write_text(content, encoding="utf-8")
                 with path.open("rb") as f:
-                    await q.message.reply_document(
-                        f, filename="configs.json", caption="📋 JSON آماده است."
-                    )
-                await q.message.reply_text("📋 پایان JSON", reply_markup=result_menu(owner))
+                    await q.message.reply_document(f, filename="prodecryptor-result.json", caption="📋 JSON کامل نتیجه موتور")
             finally:
                 path.unlink(missing_ok=True)
+            await q.message.reply_text("📋 JSON ارسال شد.", reply_markup=result_menu(owner))
         return
 
     if action == "info":
-        counts = protocol_counts(links)
+        counts = job.get("protocol_counts", protocol_counts(links))
         lines = [
-            "🔍 <b>اطلاعات</b>",
-            "",
-            f"📄 فایل‌ها: <b>{len(source_files)}</b>",
-            f"🔗 لینک‌ها: <b>{len(links)}</b>",
+            "🔍 <b>اطلاعات نتیجه</b>", "",
+            f"📄 فایل‌های خروجی: <b>{len(files)}</b>",
+            f"🔗 URIهای معتبر: <b>{len(links)}</b>",
+            f"🔑 کلیدهای صریح: <b>{len(keys)}</b>",
+            f"🧩 JSONهای تشخیص‌داده‌شده: <b>{len(json_values)}</b>",
         ]
         if counts:
-            lines += ["", "📡 <b>پروتکل‌ها:</b>"]
+            lines += ["", "📡 <b>پروتکل‌های URI:</b>"]
             for p, c in sorted(counts.items()):
                 lines.append(f"• <code>{esc(p)}</code>: {c}")
-        await q.message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            reply_markup=result_menu(owner),
-        )
+        if files:
+            lines += ["", "📦 <b>فایل‌های موتور:</b>"]
+            for x in files[:30]:
+                kind = "binary" if x["binary"] else "text"
+                lines.append(f"• <code>{esc(x['name'])}</code> — {file_size_text(x['size'])} — {kind}")
+        await q.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=result_menu(owner))
         return
 
     if action == "raw":
         if not raw:
-            await q.message.reply_text("❌ خروجی خالی است.")
+            await q.message.reply_text("❌ خروجی متنی وجود ندارد.", reply_markup=result_menu(owner))
             return
         path = Path(tempfile.mkstemp(prefix="pd-", suffix=".txt")[1])
         try:
             path.write_text(raw, encoding="utf-8")
             with path.open("rb") as f:
-                await q.message.reply_document(
-                    f, filename="output.txt", caption="📄 خروجی آماده است."
-                )
+                await q.message.reply_document(f, filename="engine-output.txt", caption="📄 خروجی متنی واقعی موتور")
         finally:
             path.unlink(missing_ok=True)
         return
 
+    if action == "files":
+        if not files:
+            await q.message.reply_text("❌ فایل خروجی جداگانه‌ای وجود ندارد.", reply_markup=result_menu(owner))
+            return
+        sent = 0
+        skipped = 0
+        for item in files:
+            path = item["path"]
+            try:
+                if not path.exists() or path.stat().st_size > 49 * 1024 * 1024:
+                    skipped += 1
+                    continue
+                with path.open("rb") as f:
+                    await q.message.reply_document(f, filename=Path(item["name"]).name, caption=f"📦 خروجی موتور: {item['name']}")
+                sent += 1
+            except Exception as exc:
+                skipped += 1
+                log.warning("could not send engine output %s: %s", path, exc)
+        await q.message.reply_text(f"📦 ارسال فایل‌های خروجی تمام شد. موفق: {sent} | ردشده: {skipped}", reply_markup=result_menu(owner))
+        return
+
     if action == "delete":
         cleanup_job(owner)
-        await q.message.reply_text(
-            "🗑 نتیجه حذف شد.",
-            reply_markup=user_menu(),
-        )
+        await q.message.reply_text("🗑 نتیجه حذف شد.", reply_markup=user_menu())
 
 
 # ============================================================
@@ -1746,6 +1832,14 @@ async def admin_callback(update, context):
         await admin_engine_logs(q)
     elif d == "admin:channels":
         await admin_channels(q)
+    elif d == "admin:app_formats":
+        await admin_app_formats(q)
+    elif d.startswith("admin:appfmt:toggle:"):
+        ext = "." + d.rsplit(":", 1)[1].lower()
+        if ext in APP_FORMATS:
+            key = APP_FORMATS[ext]["setting"]
+            DB.set_setting(key, "0" if app_format_enabled(ext) else "1")
+        await admin_app_formats(q)
     elif d == "admin:channel:add":
         ADMIN_STATE[ADMIN_ID] = {"type": "channel", "step": "chat", "data": {}}
         await q.message.reply_text("🔒 مرحله 1 از 2\nشناسه کانال یا @username را ارسال کن. بات باید در آن کانال ادمین باشد.", reply_markup=back_button("admin:channels"))
@@ -1797,6 +1891,21 @@ async def admin_callback(update, context):
 
 def back_button(callback):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=callback, style="primary")]])
+
+async def admin_app_formats(q):
+    lines = ["📦 <b>مدیریت فرمت‌های اپ</b>", "", "این بخش فقط فرمت فایل ورودی را کنترل می‌کند؛ با پروتکل‌های خروجی اشتباه نشود.", ""]
+    rows = []
+    for ext, meta in APP_FORMATS.items():
+        enabled = app_format_enabled(ext)
+        lines.append(f"{'🟢' if enabled else '⚪'} <b>{esc(meta['name'])}</b> <code>{ext}</code>")
+        rows.append([InlineKeyboardButton(
+            f"{'🟢 فعال' if enabled else '⚪ غیرفعال'} — {meta['name']}",
+            callback_data=f"admin:appfmt:toggle:{ext[1:]}",
+            style="success" if enabled else "primary",
+        )])
+    rows.append([InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")])
+    await q.message.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
 
 async def admin_database(q):
     exists = DB_PATH.exists()
@@ -2396,7 +2505,7 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    log.info("Starting ProDecryptor v1")
+    log.info("Starting %s v%s", APP_NAME, APP_VERSION)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
