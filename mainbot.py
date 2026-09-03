@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ProDecryptor - single-file Telegram bot | v23
+# ProDecryptor - single-file Telegram bot | v0
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -1221,7 +1221,11 @@ async def handle_document(update, context):
             DB.finish_job(job_id, "failed", 0, "password-protected or interactive input requested")
             raise RuntimeError("این فایل برای باز شدن به کلید/رمزی نیاز دارد که موتور در خود فایل پیدا نکرده است.")
 
-        if rc != 0 or not output_exists(output_dir):
+        # The decoder may create the output successfully and then be terminated
+        # before its normal 5-second shutdown delay completes. In that case the
+        # OS return code can be non-zero even though a valid output exists.
+        # A real produced output is therefore authoritative for success.
+        if not output_exists(output_dir):
             raise RuntimeError(engine_failure_reason(rc, stdout, stderr, ext))
 
         raw, source_files = output_text(output_dir)
@@ -2181,7 +2185,7 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    log.info("Starting ProDecryptor v23")
+    log.info("Starting ProDecryptor v0")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
