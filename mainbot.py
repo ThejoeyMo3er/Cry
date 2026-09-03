@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ProDecryptor - single-file Telegram bot | v20
+# ProDecryptor - single-file Telegram bot | v22
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -528,21 +528,36 @@ def normalize_link(link):
     return link.strip().rstrip(".,;)]}>'\"")
 
 
-KEY_RE = re.compile(r"(?im)^\s*(?:key|appkey|config[_ -]?key)\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9._:+/=-]{5,})\s*$")
+KEY_LABEL_RE = re.compile(
+    r"(?im)^\s*(?:[#>*`\-_/]+\s*)?(?:key|app\s*key|appkey|config\s*key|configkey|access\s*key|accesskey|subscription\s*key|pass\s*key|passkey)\s*[:=\-]\s*([^\r\n`<>]+?)\s*$"
+)
+JSON_KEY_RE = re.compile(
+    r"(?i)[\"'](?:appKey|configKey|accessKey|subscriptionKey|passKey|passkey|key)[\"']\s*[:=]\s*[\"']([^\"']+)[\"']"
+)
+STANDALONE_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z0-9]{2,}(?:-[A-Za-z0-9]{2,}){2,})(?![A-Za-z0-9])"
+)
 
 def extract_links(text):
-    found = []
+    """Extract proxy URIs and configuration keys from text or decrypted output."""
+    found, seen = [], set()
+    def add(value, allow_plain=False):
+        value = normalize_link(str(value).strip().strip('\"\'.,;'))
+        if not value:
+            return
+        low = value.lower()
+        if low.startswith(URI_SCHEMES) or allow_plain or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+/=-]{5,}", value):
+            if value not in seen:
+                seen.add(value); found.append(value)
     for link in URL_RE.findall(text or ""):
-        link = normalize_link(link)
-        if link and link.lower().startswith(URI_SCHEMES) and link not in found:
-            found.append(link)
-    # Some modern exports intentionally contain a Key/AppKey instead of URI links.
-    for key in KEY_RE.findall(text or ""):
-        key = normalize_link(key)
-        if key and key not in found:
-            found.append(key)
+        add(link)
+    for key in KEY_LABEL_RE.findall(text or ""):
+        add(key, allow_plain=True)
+    for key in JSON_KEY_RE.findall(text or ""):
+        add(key, allow_plain=True)
+    for key in STANDALONE_KEY_RE.findall(text or ""):
+        add(key, allow_plain=True)
     return found
-
 
 def links_codeblock(links):
     # Keep every item on its own line and preserve the code-block/copy affordance.
@@ -778,6 +793,25 @@ async def start(update, context):
     )
 
 
+async def help_command(update, context):
+    if not await guard(update): return
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        if not await require_join(update, context): return
+        if not await ask_captcha(update, context): return
+    await update.message.reply_text(
+        "ℹ️ <b>راهنمای کامل و ساده ProDecryptor</b>\n\n"
+        "📤 <b>ارسال فایل</b>\nبرای فایل‌های واقعی کانفیگ استفاده کن: <code>SLIP</code>، <code>EHI</code>، <code>DARK</code>، <code>HAT</code>، <code>NPVT</code>، <code>NPVS</code>، <code>NM</code> و <code>HAPP</code>.\n\n"
+        "🔗 <b>ارسال لینک/متن</b>\nبرای وقتی است که لینک یا کلید را به‌صورت متن داری؛ بات موارد قابل شناسایی را جدا می‌کند.\n\n"
+        "🌐 <b>موارد قابل شناسایی</b>\nVLESS، VMess، Trojan، Shadowsocks، SOCKS، Hysteria، Hysteria2، TUIC، WireGuard و SSH.\n\n"
+        "🔑 <b>کلیدها</b>\nفرمت‌های مختلف کلید مثل <code>Key:</code>، <code>AppKey:</code>، <code>ConfigKey:</code> و کلیدهای مشابه بررسی می‌شوند.\n\n"
+        "📋 <b>بعد از پردازش</b>\n«لینک‌ها» فقط موارد قابل استخراج را می‌دهد، «JSON» نتیجه ساختاریافته را می‌دهد، «اطلاعات» خلاصه نتیجه را نشان می‌دهد و «خروجی» فایل کامل پردازش‌شده را می‌فرستد.\n\n"
+        "📦 <b>تعداد زیاد</b>\nاگر تعداد لینک‌ها زیاد باشد، خودکار در چند پیام تقسیم می‌شوند و هر پیام جداگانه قابل کپی است.\n\n"
+        "🔐 <b>فایل رمزدار</b>\nدر صورت نیاز، رمز از تو گرفته می‌شود و فایل دوباره بررسی می‌شود.\n\n"
+        "🆘 <b>دستورها</b>\n<code>/start</code> شروع کار\n<code>/help</code> راهنما\n<code>/cancel</code> لغو عملیات جاری",
+        parse_mode=ParseMode.HTML, reply_markup=user_menu())
+
+
 async def cancel(update, context):
     uid = update.effective_user.id
     if uid == ADMIN_ID:
@@ -838,10 +872,8 @@ async def handle_captcha_answer(update, context):
             await context.bot.send_message(ADMIN_ID, f"⛔ <b>کاربر به‌دلیل ۵ پاسخ اشتباه مسدود شد.</b>\n\n🆔 <code>{uid}</code>\n👤 {esc(name or 'بدون نام')}\n🔹 {esc(username)}", parse_mode=ParseMode.HTML, reply_markup=kb)
         except Exception: pass
         return
-    await context.bot.send_message(uid, f"❌ پاسخ اشتباه بود.\nتلاش باقی‌مانده: <b>{max_attempts-failures}</b>", parse_mode=ParseMode.HTML)
-    # New challenge replaces the old one; old answer/question are already gone.
-    class Dummy: pass
-    dummy = Dummy(); dummy.effective_user = update.effective_user; dummy.message = type("M", (), {"reply_text": lambda self, *a, **k: None})()
+    # The previous question and answer have already been deleted. Replace them
+    # with one fresh challenge without leaving extra captcha messages behind.
     a,b,ans = new_captcha()
     sent = await context.bot.send_message(uid, f"🤖 <b>{a} + {b} = ؟</b>", parse_mode=ParseMode.HTML)
     CAPTCHA_PENDING[uid] = {"answer": ans, "question_id": sent.message_id}
@@ -849,6 +881,8 @@ async def handle_captcha_answer(update, context):
 async def menu_callback(update, context):
     q = update.callback_query
     await q.answer()
+    if not await guard(update):
+        return
     uid = q.from_user.id
     if uid != ADMIN_ID and not await require_join(update, context):
         return
@@ -856,10 +890,11 @@ async def menu_callback(update, context):
     if q.data == "menu:upload":
         await q.message.reply_text(
             "📤 فایل را مستقیم ارسال کن.\n\n"
-            "فرمت‌های شناخته‌شده شامل NPVT، NPVS، SLIP، EHI، DARK، HAT، NM و HAPP هستند."
+            "فرمت‌های شناخته‌شده شامل NPVT، NPVS، SLIP، EHI، DARK، HAT، NM و HAPP هستند.",
+            reply_markup=back_button("menu:help"),
         )
     elif q.data == "menu:link":
-        await q.message.reply_text("🔗 لینک را همینجا ارسال کن.")
+        await q.message.reply_text("🔗 لینک یا متن را همینجا ارسال کن.", reply_markup=back_button("menu:help"))
     elif q.data == "menu:quota":
         limit = int(DB.setting("daily_limit", "5"))
         used = DB.daily_usage(uid)
@@ -900,9 +935,6 @@ async def handle_text(update, context):
     if not await require_join(update, context):
         return
 
-    if uid != ADMIN_ID and not await ask_captcha(update, context):
-        return
-
     if uid == ADMIN_ID and uid in ADMIN_STATE:
         await handle_admin_state(update, context)
         return
@@ -910,6 +942,9 @@ async def handle_text(update, context):
     job = USER_JOBS.get(uid)
     if job and job.get("pending_password"):
         await handle_password(update, context)
+        return
+
+    if uid != ADMIN_ID and not await ask_captcha(update, context):
         return
 
     if maintenance_on() and uid != ADMIN_ID:
@@ -946,40 +981,54 @@ async def handle_text(update, context):
 # ============================================================
 
 async def run_engine(input_dir, output_dir, password=""):
+    """Run the engine and return as soon as its output file is written."""
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    timeout = int(DB.setting("process_timeout", str(DEFAULT_PROCESS_TIMEOUT)))
-    command = [
-        PANTEGNOS_BIN,
-        "-input", str(input_dir),
-        "-output", str(output_dir),
-    ]
-
+    timeout = max(10, int(DB.setting("process_timeout", str(DEFAULT_PROCESS_TIMEOUT))))
+    command = [PANTEGNOS_BIN, "-input", str(input_dir), "-output", str(output_dir)]
+    log.info("engine start input=%s output=%s password=%s", input_dir, output_dir, bool(password))
     async with JOB_SEMAPHORE:
-        proc = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdin_data = ((password if password else "") + "\n").encode()
-
         try:
-            out, err = await asyncio.wait_for(
-                proc.communicate(stdin_data),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise RuntimeError("زمان پردازش فایل تمام شد.")
-
-    return (
-        proc.returncode,
-        out.decode("utf-8", errors="replace"),
-        err.decode("utf-8", errors="replace"),
-    )
-
+            proc = await asyncio.create_subprocess_exec(*command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=str(input_dir.parent))
+        except FileNotFoundError as exc:
+            log.exception("engine executable not found: %s", PANTEGNOS_BIN)
+            raise RuntimeError("موتور پردازش روی سرور در دسترس نیست.") from exc
+        communicate_task = asyncio.create_task(proc.communicate(((password if password else "") + "\n").encode("utf-8")))
+        deadline = time.monotonic() + timeout
+        output_seen = False
+        try:
+            while not communicate_task.done():
+                if output_exists(output_dir):
+                    output_seen = True
+                    await asyncio.sleep(0.08)
+                    if not communicate_task.done():
+                        try: proc.terminate()
+                        except ProcessLookupError: pass
+                    break
+                if time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError
+                await asyncio.sleep(0.05)
+            if output_seen:
+                try:
+                    out, err = await asyncio.wait_for(communicate_task, timeout=2)
+                except asyncio.TimeoutError:
+                    try: proc.kill()
+                    except ProcessLookupError: pass
+                    out, err = await communicate_task
+            else:
+                out, err = await asyncio.wait_for(communicate_task, timeout=max(1, deadline-time.monotonic()))
+        except asyncio.TimeoutError as exc:
+            if not communicate_task.done():
+                try: proc.kill()
+                except ProcessLookupError: pass
+                await communicate_task
+            log.error("engine timeout after %ss", timeout)
+            raise RuntimeError("زمان پردازش فایل تمام شد.") from exc
+    stdout = out.decode("utf-8", errors="replace")
+    stderr = err.decode("utf-8", errors="replace")
+    log.info("engine finished rc=%s output_seen=%s stdout=%d stderr=%d", proc.returncode, output_seen, len(stdout), len(stderr))
+    if stdout.strip(): log.info("engine stdout: %s", stdout[-12000:])
+    if stderr.strip(): log.warning("engine stderr: %s", stderr[-12000:])
+    return proc.returncode, stdout, stderr
 
 def output_text(output_dir):
     files = sorted(p for p in output_dir.rglob("*") if p.is_file())
@@ -1004,10 +1053,27 @@ def password_prompt_detected(stdout, stderr):
     return any(x in text for x in (
         "enter password",
         "enter passkey",
+        "enter passphrase",
         "password:",
         "passkey:",
+        "passphrase:",
+        "passphrase required to open this config",
+        "this config is passphrase-protected",
     ))
 
+
+
+def engine_failure_reason(rc, stdout, stderr, ext=""):
+    text = (stdout + "\n" + stderr).strip()
+    low = text.lower()
+    if "bad magic" in low or "invalid format" in low or "no matching module" in low:
+        return "ساختار فایل با این فرمت سازگار نیست یا فایل ناقص است."
+    if "incorrect passphrase" in low or "password" in low and "required" in low:
+        return "فایل رمز دارد یا رمز واردشده صحیح نیست."
+    if rc != 0 and text:
+        # Never expose internal engine branding or raw noisy banners to users.
+        return "پردازش فایل با خطای داخلی انجام نشد."
+    return "فایل خراب، ناقص یا غیرقابل پردازش است."
 
 # ============================================================
 # File processing
@@ -1137,7 +1203,7 @@ async def handle_document(update, context):
             return
 
         if rc != 0 or not output_exists(output_dir):
-            raise RuntimeError("فایل رمزگشایی نشد یا فایل ناقص/نامعتبر است.")
+            raise RuntimeError(engine_failure_reason(rc, stdout, stderr, ext))
 
         raw, source_files = output_text(output_dir)
         if not raw.strip():
@@ -1167,9 +1233,10 @@ async def handle_document(update, context):
             reply_markup=result_menu(uid),
         )
 
-    except Exception:
+    except Exception as exc:
+        log.exception("file processing failed user=%s file=%s", uid, filename)
         DB.record_failure(uid)
-        DB.finish_job(job_id, "failed", 0, "processing failed")
+        DB.finish_job(job_id, "failed", 0, str(exc)[:500])
         DB.refund_daily(uid)
         cleanup_job(uid)
 
@@ -1246,7 +1313,8 @@ async def handle_password(update, context):
 async def result_callback(update, context):
     q = update.callback_query
     await q.answer()
-
+    if not await guard(update):
+        return
     if not await require_join(update, context):
         return
 
@@ -1272,8 +1340,10 @@ async def result_callback(update, context):
                 reply_markup=result_menu(owner),
             )
             return
-        for chunk_items in split_link_chunks(links):
+        chunks = split_link_chunks(links)
+        for chunk_items in chunks:
             await q.message.reply_text(links_codeblock(chunk_items), parse_mode=ParseMode.MARKDOWN)
+        await q.message.reply_text("🔗 پایان فهرست لینک‌ها", reply_markup=result_menu(owner))
         return
 
     if action == "json":
@@ -1301,6 +1371,7 @@ async def result_callback(update, context):
                     await q.message.reply_document(
                         f, filename="configs.json", caption="📋 JSON آماده است."
                     )
+                await q.message.reply_text("📋 پایان JSON", reply_markup=result_menu(owner))
             finally:
                 path.unlink(missing_ok=True)
         return
@@ -2046,6 +2117,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("cancel", cancel))
 
@@ -2060,7 +2132,7 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    log.info("Starting ProDecryptor")
+    log.info("Starting ProDecryptor v22")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
