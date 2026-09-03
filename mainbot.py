@@ -1,15 +1,20 @@
 import asyncio
+import html
 import json
 import logging
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -20,818 +25,1619 @@ from telegram.ext import (
 )
 
 # ============================================================
-# Configuration
+# ProDecryptor - single-file Telegram bot
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = 5728292317
 
-PANTEGNOS_BIN = os.getenv(
-    "PANTEGNOS_BIN",
-    "/opt/pantegnos/pantegnos",
-)
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+DB_PATH = DATA_DIR / "prodecryptor.db"
 
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(50 * 1024 * 1024)))
-PROCESS_TIMEOUT = int(os.getenv("PROCESS_TIMEOUT", "60"))
+PANTEGNOS_BIN = os.getenv("PANTEGNOS_BIN", "/opt/pantegnos/pantegnos")
 
-# Telegram message text limit is ~4096.
-# Keep a safety margin.
-MESSAGE_LIMIT = 3900
+DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024
+DEFAULT_PROCESS_TIMEOUT = 90
+MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2")))
+TELEGRAM_CHUNK = 3900
 
 SUPPORTED_EXTENSIONS = {
-    ".slip",
-    ".ehi",
-    ".dark",
-    ".hat",
-    ".npvt",
-    ".npvs",
-    ".nm",
-    ".happ",
+    ".slip", ".ehi", ".dark", ".hat", ".npvt", ".npvs", ".nm", ".happ",
 }
 
-# Common V2Ray / proxy URI schemes.
 URI_SCHEMES = (
-    "vless://",
-    "vmess://",
-    "trojan://",
-    "ss://",
-    "socks://",
-    "socks5://",
-    "http://",
-    "https://",
-    "hysteria://",
-    "hysteria2://",
-    "hy2://",
-    "tuic://",
-    "wireguard://",
-    "ssh://",
+    "vless://", "vmess://", "trojan://", "ss://", "socks://", "socks5://",
+    "hysteria://", "hysteria2://", "hy2://", "tuic://", "wireguard://", "ssh://",
 )
 
-# Generic URL-ish matcher.
 URL_RE = re.compile(
-    r"(?i)(?:"
-    r"vless|vmess|trojan|ss|socks5?|hysteria2?|hy2|tuic|wireguard|ssh"
-    r")://[^\s<>\[\]{}\"']+"
+    r"(?i)(?:vless|vmess|trojan|ss|socks5?|hysteria2?|hy2|tuic|wireguard|ssh)://[^\s<>\[\]{}\"']+"
 )
-
-# ============================================================
-# Logging
-# ============================================================
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
+log = logging.getLogger("prodecryptor")
 
-logger = logging.getLogger("pantegnos-bot")
+JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+USER_JOBS = {}
+ADMIN_STATE = {}
+
+
+# ============================================================
+# Database
+# ============================================================
+
+class Database:
+    def __init__(self, path):
+        self.path = path
+        self.conn = None
+
+    def open(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.init_schema()
+        self.seed()
+
+    def init_schema(self):
+        self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            last_name TEXT DEFAULT '',
+            is_blocked INTEGER DEFAULT 0,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            total_files INTEGER DEFAULT 0,
+            successful_files INTEGER DEFAULT 0,
+            failed_files INTEGER DEFAULT 0,
+            total_links INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS daily_usage (
+            user_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY(user_id, day),
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS sponsors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            button_text TEXT NOT NULL,
+            style TEXT NOT NULL DEFAULT 'primary',
+            active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            extension TEXT NOT NULL,
+            status TEXT NOT NULL,
+            links_count INTEGER DEFAULT 0,
+            error TEXT DEFAULT '',
+            created_at INTEGER NOT NULL,
+            finished_at INTEGER DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
+        CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
+        """)
+        self.conn.commit()
+
+    def seed(self):
+        defaults = {
+            "daily_limit": "5",       # 0 = unlimited
+            "maintenance": "0",
+            "max_file_size": str(DEFAULT_MAX_FILE_SIZE),
+            "process_timeout": str(DEFAULT_PROCESS_TIMEOUT),
+        }
+        for k, v in defaults.items():
+            self.conn.execute(
+                "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v)
+            )
+        self.conn.commit()
+
+    def setting(self, key, default=""):
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        self.conn.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def upsert_user(self, user):
+        now = int(time.time())
+        self.conn.execute(
+            """
+            INSERT INTO users(user_id,username,first_name,last_name,first_seen,last_seen)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              username=excluded.username,
+              first_name=excluded.first_name,
+              last_name=excluded.last_name,
+              last_seen=excluded.last_seen
+            """,
+            (
+                user.id, user.username or "", user.first_name or "",
+                user.last_name or "", now, now,
+            ),
+        )
+        self.conn.commit()
+
+    def get_user(self, user_id):
+        return self.conn.execute(
+            "SELECT * FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+
+    def set_blocked(self, user_id, blocked):
+        self.conn.execute(
+            "UPDATE users SET is_blocked=? WHERE user_id=?",
+            (1 if blocked else 0, user_id),
+        )
+        self.conn.commit()
+
+    def daily_usage(self, user_id):
+        row = self.conn.execute(
+            "SELECT count FROM daily_usage WHERE user_id=? AND day=?",
+            (user_id, utc_day()),
+        ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def consume_daily(self, user_id):
+        limit = int(self.setting("daily_limit", "5"))
+        if limit == 0:
+            self.conn.execute(
+                "UPDATE users SET total_files=total_files+1 WHERE user_id=?",
+                (user_id,),
+            )
+            self.conn.commit()
+            return True
+
+        day = utc_day()
+        row = self.conn.execute(
+            "SELECT count FROM daily_usage WHERE user_id=? AND day=?",
+            (user_id, day),
+        ).fetchone()
+        current = int(row["count"]) if row else 0
+        if current >= limit:
+            return False
+
+        if row:
+            self.conn.execute(
+                "UPDATE daily_usage SET count=count+1 WHERE user_id=? AND day=?",
+                (user_id, day),
+            )
+        else:
+            self.conn.execute(
+                "INSERT INTO daily_usage(user_id,day,count) VALUES(?,?,1)",
+                (user_id, day),
+            )
+
+        self.conn.execute(
+            "UPDATE users SET total_files=total_files+1 WHERE user_id=?",
+            (user_id,),
+        )
+        self.conn.commit()
+        return True
+
+    def refund_daily(self, user_id):
+        limit = int(self.setting("daily_limit", "5"))
+        if limit == 0:
+            self.conn.execute(
+                "UPDATE users SET total_files=CASE WHEN total_files>0 THEN total_files-1 ELSE 0 END WHERE user_id=?",
+                (user_id,),
+            )
+            self.conn.commit()
+            return
+
+        day = utc_day()
+        self.conn.execute(
+            "UPDATE daily_usage SET count=CASE WHEN count>0 THEN count-1 ELSE 0 END "
+            "WHERE user_id=? AND day=?",
+            (user_id, day),
+        )
+        self.conn.execute(
+            "UPDATE users SET total_files=CASE WHEN total_files>0 THEN total_files-1 ELSE 0 END "
+            "WHERE user_id=?",
+            (user_id,),
+        )
+        self.conn.commit()
+
+    def record_success(self, user_id, links):
+        self.conn.execute(
+            "UPDATE users SET successful_files=successful_files+1,total_links=total_links+? WHERE user_id=?",
+            (links, user_id),
+        )
+        self.conn.commit()
+
+    def record_failure(self, user_id):
+        self.conn.execute(
+            "UPDATE users SET failed_files=failed_files+1 WHERE user_id=?",
+            (user_id,),
+        )
+        self.conn.commit()
+
+    def create_job(self, job_id, user_id, filename, extension):
+        self.conn.execute(
+            "INSERT INTO jobs(id,user_id,filename,extension,status,created_at) VALUES(?,?,?,?,?,?)",
+            (job_id, user_id, filename, extension, "processing", int(time.time())),
+        )
+        self.conn.commit()
+
+    def finish_job(self, job_id, status, links=0, error=""):
+        self.conn.execute(
+            "UPDATE jobs SET status=?,links_count=?,error=?,finished_at=? WHERE id=?",
+            (status, links, error[:2000], int(time.time()), job_id),
+        )
+        self.conn.commit()
+
+    def sponsors(self, active_only=True):
+        if active_only:
+            return self.conn.execute(
+                "SELECT * FROM sponsors WHERE active=1 ORDER BY sort_order,id"
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM sponsors ORDER BY sort_order,id"
+        ).fetchall()
+
+    def sponsor(self, sponsor_id):
+        return self.conn.execute(
+            "SELECT * FROM sponsors WHERE id=?", (sponsor_id,)
+        ).fetchone()
+
+    def add_sponsor(self, name, url, button_text, style, active=True):
+        now = int(time.time())
+        order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM sponsors"
+        ).fetchone()["n"]
+        cur = self.conn.execute(
+            """
+            INSERT INTO sponsors(name,url,button_text,style,active,sort_order,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (name, url, button_text, style, 1 if active else 0, int(order), now, now),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_sponsor(self, sponsor_id, name, url, button_text, style):
+        self.conn.execute(
+            """
+            UPDATE sponsors
+            SET name=?,url=?,button_text=?,style=?,updated_at=?
+            WHERE id=?
+            """,
+            (name, url, button_text, style, int(time.time()), sponsor_id),
+        )
+        self.conn.commit()
+
+    def set_sponsor_active(self, sponsor_id, active):
+        self.conn.execute(
+            "UPDATE sponsors SET active=?,updated_at=? WHERE id=?",
+            (1 if active else 0, int(time.time()), sponsor_id),
+        )
+        self.conn.commit()
+
+    def delete_sponsor(self, sponsor_id):
+        self.conn.execute("DELETE FROM sponsors WHERE id=?", (sponsor_id,))
+        self.conn.commit()
+
+    def stats(self):
+        total_users = self.conn.execute(
+            "SELECT COUNT(*) n FROM users"
+        ).fetchone()["n"]
+        active_24h = self.conn.execute(
+            "SELECT COUNT(*) n FROM users WHERE last_seen>=?",
+            (int(time.time()) - 86400,),
+        ).fetchone()["n"]
+        blocked = self.conn.execute(
+            "SELECT COUNT(*) n FROM users WHERE is_blocked=1"
+        ).fetchone()["n"]
+        totals = self.conn.execute(
+            "SELECT COALESCE(SUM(total_files),0) files,"
+            "COALESCE(SUM(successful_files),0) success,"
+            "COALESCE(SUM(failed_files),0) failed,"
+            "COALESCE(SUM(total_links),0) links FROM users"
+        ).fetchone()
+        jobs24 = self.conn.execute(
+            "SELECT COUNT(*) n FROM jobs WHERE created_at>=?",
+            (int(time.time()) - 86400,),
+        ).fetchone()["n"]
+        return {
+            "users": int(total_users),
+            "active": int(active_24h),
+            "blocked": int(blocked),
+            "files": int(totals["files"]),
+            "success": int(totals["success"]),
+            "failed": int(totals["failed"]),
+            "links": int(totals["links"]),
+            "jobs24": int(jobs24),
+        }
+
+    def users_page(self, page, per_page=8):
+        return self.conn.execute(
+            "SELECT * FROM users ORDER BY last_seen DESC LIMIT ? OFFSET ?",
+            (per_page, page * per_page),
+        ).fetchall()
+
+    def user_count(self):
+        return int(self.conn.execute("SELECT COUNT(*) n FROM users").fetchone()["n"])
+
+    def recent_jobs(self, limit=15):
+        return self.conn.execute(
+            "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+
+DB = Database(DB_PATH)
 
 
 # ============================================================
 # Helpers
 # ============================================================
 
-def ensure_configured():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set")
-
-    if not os.path.isfile(PANTEGNOS_BIN):
-        raise RuntimeError(
-            f"Pantegnos binary not found: {PANTEGNOS_BIN}"
-        )
+def utc_day():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def normalize_link(link: str) -> str:
-    """
-    Remove characters that are commonly captured accidentally
-    at the end of a URI.
-    """
+def now_text():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def esc(value):
+    return html.escape(str(value or ""), quote=True)
+
+
+def mdv2(value):
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", value)
+
+
+def normalize_link(link):
     return link.strip().rstrip(".,;)]}>'\"")
 
 
-def extract_links(text: str) -> list[str]:
-    """
-    Extract supported proxy/V2Ray links from arbitrary text.
-    Keeps order and removes duplicates.
-    """
+def extract_links(text):
     found = []
-
-    for match in URL_RE.findall(text or ""):
-        link = normalize_link(match)
-
-        if not link:
-            continue
-
-        lower = link.lower()
-
-        if not lower.startswith(URI_SCHEMES):
-            continue
-
-        if link not in found:
+    for link in URL_RE.findall(text or ""):
+        link = normalize_link(link)
+        if link and link.lower().startswith(URI_SCHEMES) and link not in found:
             found.append(link)
-
     return found
 
 
-def split_message(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
-    """
-    Split long output into Telegram-safe messages.
-    """
+def links_codeblock(links):
+    body = "\n".join(mdv2(x) for x in links)
+    return "```\n" + body + "\n```"
+
+
+def split_text(text, limit=TELEGRAM_CHUNK):
     if len(text) <= limit:
         return [text]
-
-    chunks = []
+    result = []
     current = ""
-
     for line in text.splitlines(True):
         if len(current) + len(line) <= limit:
             current += line
         else:
             if current:
-                chunks.append(current)
+                result.append(current)
             current = line
-
     if current:
-        chunks.append(current)
-
-    # Extremely long single lines.
-    final_chunks = []
-
-    for chunk in chunks:
-        while len(chunk) > limit:
-            final_chunks.append(chunk[:limit])
-            chunk = chunk[limit:]
-
-        if chunk:
-            final_chunks.append(chunk)
-
-    return final_chunks
+        result.append(current)
+    final = []
+    for part in result:
+        while len(part) > limit:
+            final.append(part[:limit])
+            part = part[limit:]
+        if part:
+            final.append(part)
+    return final
 
 
-def format_links(links: list[str]) -> str:
-    """
-    Create a compact Telegram-friendly list.
-    """
-    lines = [
-        "🔗 <b>V2Ray / Proxy Links</b>",
-        f"📦 تعداد: <b>{len(links)}</b>",
-        "",
+def file_size_text(n):
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+def protocol_counts(links):
+    result = {}
+    for link in links:
+        p = link.split("://", 1)[0].lower()
+        result[p] = result.get(p, 0) + 1
+    return result
+
+
+def cleanup_job(user_id):
+    job = USER_JOBS.pop(user_id, None)
+    if job and job.get("directory"):
+        shutil.rmtree(job["directory"], ignore_errors=True)
+
+
+def maintenance_on():
+    return DB.setting("maintenance", "0") == "1"
+
+
+def admin_only(user_id):
+    return user_id == ADMIN_ID
+
+
+def sponsor_rows():
+    rows = []
+    for s in DB.sponsors(True):
+        style = s["style"] if s["style"] in {"primary", "success", "danger"} else "primary"
+        rows.append([
+            InlineKeyboardButton(
+                s["button_text"], url=s["url"], style=style
+            )
+        ])
+    return rows
+
+
+# ============================================================
+# Keyboards
+# ============================================================
+
+def user_menu():
+    rows = [
+        [
+            InlineKeyboardButton("📤 ارسال فایل", callback_data="menu:upload", style="primary"),
+            InlineKeyboardButton("🔗 ارسال لینک", callback_data="menu:link", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("📊 سهمیه من", callback_data="menu:quota", style="success"),
+            InlineKeyboardButton("ℹ️ راهنما", callback_data="menu:help", style="primary"),
+        ],
     ]
-
-    for i, link in enumerate(links, 1):
-        lines.append(f"<b>{i}.</b> <code>{escape_html(link)}</code>")
-
-    return "\n".join(lines)
+    rows.extend(sponsor_rows())
+    return InlineKeyboardMarkup(rows)
 
 
-def escape_html(value: str) -> str:
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
+def result_menu(user_id):
+    rows = [
+        [
+            InlineKeyboardButton("🔗 لینک‌ها", callback_data=f"result:links:{user_id}", style="success"),
+            InlineKeyboardButton("📋 JSON", callback_data=f"result:json:{user_id}", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("🔍 اطلاعات", callback_data=f"result:info:{user_id}", style="primary"),
+            InlineKeyboardButton("📄 خروجی", callback_data=f"result:raw:{user_id}", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("🗑 حذف", callback_data=f"result:delete:{user_id}", style="danger"),
+        ],
+    ]
+    rows.extend(sponsor_rows())
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 داشبورد", callback_data="admin:dashboard", style="primary"),
+            InlineKeyboardButton("👥 کاربران", callback_data="admin:users:0", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ سهمیه و محدودیت", callback_data="admin:limits", style="primary"),
+            InlineKeyboardButton("📣 پیام همگانی", callback_data="admin:broadcast", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("🤝 اسپانسرها", callback_data="admin:sponsors", style="primary"),
+            InlineKeyboardButton("🧾 فعالیت‌ها", callback_data="admin:jobs", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("🛠 وضعیت سرویس", callback_data="admin:status", style="success"),
+            InlineKeyboardButton("⚙️ تنظیمات", callback_data="admin:settings", style="primary"),
+        ],
+    ])
+
+
+# ============================================================
+# Access / start
+# ============================================================
+
+async def guard(update):
+    user = update.effective_user
+    if not user:
+        return False
+
+    DB.upsert_user(user)
+    row = DB.get_user(user.id)
+    if row and row["is_blocked"] and user.id != ADMIN_ID:
+        if update.callback_query:
+            await update.callback_query.answer("دسترسی شما مسدود است.", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("⛔ دسترسی شما به بات مسدود شده است.")
+        return False
+    return True
+
+
+async def start(update, context):
+    if not await guard(update):
+        return
+
+    if update.effective_user.id == ADMIN_ID:
+        await update.message.reply_text(
+            "🛡 <b>ProDecryptor</b>\n\nپنل مدیریت کامل آماده است.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu(),
+        )
+        return
+
+    if maintenance_on():
+        await update.message.reply_text("🛠 بات موقتاً در حال بروزرسانی است.")
+        return
+
+    limit = int(DB.setting("daily_limit", "5"))
+    await update.message.reply_text(
+        "✨ <b>ProDecryptor</b>\n\n"
+        "فایل کانفیگ یا لینک خودت را ارسال کن.\n\n"
+        f"📅 سهمیه امروز: <b>{'∞' if limit == 0 else limit}</b> فایل",
+        parse_mode=ParseMode.HTML,
+        reply_markup=user_menu(),
     )
 
 
-def make_json(links: list[str], source_files: list[str]) -> str:
-    data = {
-        "source": "Pantegnos Telegram Bot",
-        "files": source_files,
-        "count": len(links),
-        "links": [
-            {
-                "protocol": get_protocol(link),
-                "link": link,
-            }
-            for link in links
-        ],
+async def cancel(update, context):
+    uid = update.effective_user.id
+    if uid == ADMIN_ID:
+        ADMIN_STATE.pop(ADMIN_ID, None)
+    cleanup_job(uid)
+    await update.message.reply_text(
+        "❎ عملیات لغو شد.",
+        reply_markup=admin_menu() if uid == ADMIN_ID else user_menu(),
+    )
+
+
+# ============================================================
+# User menu callback
+# ============================================================
+
+async def menu_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+
+    if q.data == "menu:upload":
+        await q.message.reply_text(
+            "📤 فایل را مستقیم ارسال کن.\n\n"
+            "فرمت‌های شناخته‌شده شامل NPVT، NPVS، SLIP، EHI، DARK، HAT، NM و HAPP هستند."
+        )
+    elif q.data == "menu:link":
+        await q.message.reply_text("🔗 لینک را همینجا ارسال کن.")
+    elif q.data == "menu:quota":
+        limit = int(DB.setting("daily_limit", "5"))
+        used = DB.daily_usage(uid)
+        text = (
+            "📊 <b>سهمیه امروز</b>\n\n"
+            f"مصرف‌شده: <b>{used}</b>\n"
+            f"سقف: <b>{'∞' if limit == 0 else limit}</b>"
+        )
+        await q.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=user_menu()
+        )
+    elif q.data == "menu:help":
+        await q.message.reply_text(
+            "ℹ️ <b>راهنما</b>\n\n"
+            "• فایل یا لینک را ارسال کن.\n"
+            "• اگر فایل رمز داشته باشد، رمز از تو گرفته می‌شود.\n"
+            "• بعد از پردازش می‌توانی لینک‌ها، JSON، اطلاعات یا خروجی را بگیری.\n"
+            "• در بخش لینک‌ها هر خط فقط یک لینک است.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_menu(),
+        )
+
+
+# ============================================================
+# Direct text / link
+# ============================================================
+
+async def handle_text(update, context):
+    if not await guard(update):
+        return
+
+    uid = update.effective_user.id
+
+    if uid == ADMIN_ID and uid in ADMIN_STATE:
+        await handle_admin_state(update, context)
+        return
+
+    job = USER_JOBS.get(uid)
+    if job and job.get("pending_password"):
+        await handle_password(update, context)
+        return
+
+    if maintenance_on() and uid != ADMIN_ID:
+        await update.message.reply_text("🛠 بات موقتاً در حال بروزرسانی است.")
+        return
+
+    links = extract_links(update.message.text or "")
+    if not links:
+        await update.message.reply_text(
+            "❌ لینک قابل شناسایی پیدا نشد.",
+            reply_markup=user_menu(),
+        )
+        return
+
+    cleanup_job(uid)
+    USER_JOBS[uid] = {
+        "directory": None,
+        "raw": update.message.text,
+        "links": links,
+        "source_files": ["پیام"],
     }
 
-    return json.dumps(
-        data,
-        ensure_ascii=False,
-        indent=2,
-    )
-
-
-def get_protocol(link: str) -> str:
-    try:
-        return link.split("://", 1)[0].lower()
-    except Exception:
-        return "unknown"
-
-
-def make_info(links: list[str], source_files: list[str]) -> str:
-    protocols = {}
-
-    for link in links:
-        protocol = get_protocol(link)
-        protocols[protocol] = protocols.get(protocol, 0) + 1
-
-    lines = [
-        "🔍 <b>Configuration Information</b>",
-        "",
-        f"📁 Files: <b>{len(source_files)}</b>",
-        f"🔗 Links: <b>{len(links)}</b>",
-    ]
-
-    if protocols:
-        lines.append("")
-        lines.append("📡 <b>Protocols:</b>")
-
-        for protocol, count in sorted(protocols.items()):
-            lines.append(
-                f"• <code>{escape_html(protocol)}</code>: {count}"
-            )
-
-    return "\n".join(lines)
-
-
-def build_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🔗 لینک‌های V2Ray",
-                    callback_data=f"links:{user_id}",
-                ),
-                InlineKeyboardButton(
-                    "📋 JSON",
-                    callback_data=f"json:{user_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔍 اطلاعات",
-                    callback_data=f"info:{user_id}",
-                ),
-                InlineKeyboardButton(
-                    "📄 خروجی خام",
-                    callback_data=f"raw:{user_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "🗑 حذف",
-                    callback_data=f"delete:{user_id}",
-                )
-            ],
-        ]
+    await update.message.reply_text(
+        f"✅ <b>{len(links)}</b> لینک شناسایی شد.\n\nانتخاب کن:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=result_menu(uid),
     )
 
 
 # ============================================================
-# Pantegnos
+# Engine
 # ============================================================
 
-async def run_pantegnos(input_dir: Path, output_dir: Path):
-    """
-    Execute the Pantegnos CLI.
-
-    Current Pantegnos CLI:
-        ./Pantegnos -input configs -output output
-    """
-
+async def run_engine(input_dir, output_dir, password=""):
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    timeout = int(DB.setting("process_timeout", str(DEFAULT_PROCESS_TIMEOUT)))
     command = [
         PANTEGNOS_BIN,
-        "-input",
-        str(input_dir),
-        "-output",
-        str(output_dir),
+        "-input", str(input_dir),
+        "-output", str(output_dir),
     ]
 
-    logger.info("Running Pantegnos: %s", command)
-
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=PROCESS_TIMEOUT,
+    async with JOB_SEMAPHORE:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
-        raise RuntimeError(
-            f"Pantegnos timed out after {PROCESS_TIMEOUT}s"
-        )
+        stdin_data = ((password if password else "") + "\n").encode()
 
-    stdout_text = stdout.decode("utf-8", errors="replace")
-    stderr_text = stderr.decode("utf-8", errors="replace")
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(stdin_data),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError("زمان پردازش فایل تمام شد.")
 
-    if process.returncode != 0:
-        logger.error(
-            "Pantegnos failed: stdout=%s stderr=%s",
-            stdout_text,
-            stderr_text,
-        )
-
-        raise RuntimeError(
-            "Pantegnos failed.\n"
-            + (stderr_text[-1500:] or stdout_text[-1500:])
-        )
-
-    return stdout_text, stderr_text
-
-
-def collect_output_files(output_dir: Path) -> list[Path]:
-    if not output_dir.exists():
-        return []
-
-    return sorted(
-        p for p in output_dir.rglob("*")
-        if p.is_file()
+    return (
+        proc.returncode,
+        out.decode("utf-8", errors="replace"),
+        err.decode("utf-8", errors="replace"),
     )
 
 
-def read_all_output(files: list[Path]) -> tuple[str, list[str]]:
+def output_text(output_dir):
+    files = sorted(p for p in output_dir.rglob("*") if p.is_file())
     parts = []
     names = []
-
     for path in files:
         try:
-            content = path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-        except Exception as exc:
-            logger.warning(
-                "Could not read %s: %s",
-                path,
-                exc,
-            )
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
             continue
-
         names.append(path.name)
-
-        parts.append(
-            f"\n===== {path.name} =====\n"
-            f"{content}\n"
-        )
-
+        parts.append(f"===== {path.name} =====\n{text}\n")
     return "\n".join(parts), names
 
 
+def output_exists(output_dir):
+    return any(p.is_file() for p in output_dir.rglob("*"))
+
+
+def password_prompt_detected(stdout, stderr):
+    text = (stdout + "\n" + stderr).lower()
+    return any(x in text for x in (
+        "enter password",
+        "enter passkey",
+        "password:",
+        "passkey:",
+    ))
+
+
 # ============================================================
-# Temporary job storage
+# File processing
 # ============================================================
 
-# user_id -> current job
-USER_JOBS: dict[int, dict] = {}
-
-
-def cleanup_job(user_id: int):
-    job = USER_JOBS.pop(user_id, None)
-
-    if not job:
+async def handle_document(update, context):
+    if not await guard(update):
         return
 
-    directory = job.get("directory")
+    uid = update.effective_user.id
 
-    if directory:
-        shutil.rmtree(directory, ignore_errors=True)
+    if maintenance_on() and uid != ADMIN_ID:
+        await update.message.reply_text("🛠 بات موقتاً در حال بروزرسانی است.")
+        return
 
+    doc = update.message.document
+    filename = Path(doc.file_name or "config.bin").name
+    ext = Path(filename).suffix.lower()
+    max_size = int(DB.setting("max_file_size", str(DEFAULT_MAX_FILE_SIZE)))
 
-# ============================================================
-# Telegram handlers
-# ============================================================
+    if doc.file_size and doc.file_size > max_size:
+        await update.message.reply_text(
+            f"❌ حجم فایل بیشتر از حد مجاز است.\nحداکثر: {file_size_text(max_size)}"
+        )
+        return
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 <b>Pantegnos Config Bot</b>\n\n"
-        "فایل کانفیگ پشتیبانی‌شده را ارسال کن.\n"
-        "بعد از پردازش می‌توانی:\n\n"
-        "🔗 همه لینک‌ها را بگیری\n"
-        "📋 JSON بگیری\n"
-        "🔍 اطلاعات کانفیگ را ببینی\n"
-        "📄 خروجی خام Pantegnos را دریافت کنی\n\n"
-        "همچنین می‌توانی مستقیماً یک لینک "
-        "VLESS / VMess / Trojan / SS و ... ارسال کنی."
-    )
+    # Plain text/JSON config files: extract links without invoking the engine.
+    if ext in {".txt", ".json", ".conf", ".log"}:
+        path = Path(tempfile.mkstemp(prefix="pd-", suffix=ext)[1])
+        try:
+            tg = await doc.get_file()
+            await tg.download_to_drive(custom_path=str(path))
+            content = path.read_text(encoding="utf-8", errors="ignore")
+            links = extract_links(content)
+            if links:
+                cleanup_job(uid)
+                USER_JOBS[uid] = {
+                    "directory": None,
+                    "raw": content,
+                    "links": links,
+                    "source_files": [filename],
+                }
+                await update.message.reply_text(
+                    f"✅ <b>{len(links)}</b> لینک پیدا شد.\n\nانتخاب کن:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=result_menu(uid),
+                )
+                return
+        finally:
+            path.unlink(missing_ok=True)
 
-    await update.message.reply_text(
-        text,
+    if ext not in SUPPORTED_EXTENSIONS:
+        await update.message.reply_text(
+            "⚠️ این فرمت در فهرست فرمت‌های قابل پردازش نیست."
+        )
+        return
+
+    if not DB.consume_daily(uid):
+        limit = int(DB.setting("daily_limit", "5"))
+        await update.message.reply_text(
+            f"⛔ سهمیه امروزت تمام شده است.\nسقف روزانه: {limit} فایل"
+        )
+        return
+
+    work_dir = Path(tempfile.mkdtemp(prefix="prodecryptor-"))
+    input_dir = work_dir / "configs"
+    output_dir = work_dir / "output"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_file = input_dir / filename
+
+    job_id = uuid.uuid4().hex
+    DB.create_job(job_id, uid, filename, ext)
+
+    status = await update.message.reply_text(
+        "⏳ <b>فایل دریافت شد.</b>\nدر حال آماده‌سازی...",
         parse_mode=ParseMode.HTML,
     )
 
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text.strip()
-    links = extract_links(text)
-
-    if not links:
-        await update.message.reply_text(
-            "❌ لینک قابل شناسایی پیدا نشد."
-        )
-        return
-
-    user_id = update.effective_user.id
-
-    cleanup_job(user_id)
-
-    USER_JOBS[user_id] = {
-        "directory": None,
-        "raw": text,
-        "output": text,
-        "links": links,
-        "source_files": ["direct-message"],
-    }
-
-    await update.message.reply_text(
-        "✅ لینک دریافت شد.\n\n"
-        f"🔗 {len(links)} لینک پیدا شد.\n"
-        "انتخاب کن:",
-        reply_markup=build_keyboard(user_id),
-    )
-
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.document:
-        return
-
-    document = update.message.document
-    user_id = update.effective_user.id
-
-    # Telegram may not always expose exact size.
-    if document.file_size and document.file_size > MAX_FILE_SIZE:
-        await update.message.reply_text(
-            f"❌ حجم فایل بیش از حد مجاز است.\n"
-            f"حداکثر: {MAX_FILE_SIZE // (1024 * 1024)} MB"
-        )
-        return
-
-    filename = document.file_name or "config.bin"
-    extension = Path(filename).suffix.lower()
-
-    if extension not in SUPPORTED_EXTENSIONS:
-        await update.message.reply_text(
-            "⚠️ پسوند این فایل در لیست فرمت‌های شناخته‌شده "
-            "Pantegnos نیست.\n\n"
-            "اگر مطمئنی فایل کانفیگ است، می‌توانی ارسالش کنی؛ "
-            "اما ممکن است Pantegnos نتواند آن را پردازش کند."
-        )
-
-    status = await update.message.reply_text(
-        "⏳ فایل دریافت شد.\n"
-        "در حال پردازش با Pantegnos..."
-    )
-
-    work_dir = Path(
-        tempfile.mkdtemp(prefix="pantegnos-")
-    )
-
-    input_dir = work_dir / "configs"
-    output_dir = work_dir / "output"
-
-    input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     try:
-        telegram_file = await document.get_file()
+        tg = await doc.get_file()
+        await tg.download_to_drive(custom_path=str(input_file))
 
-        input_file = input_dir / filename
-
-        await telegram_file.download_to_drive(
-            custom_path=str(input_file)
-        )
-
-        actual_size = input_file.stat().st_size
-
-        if actual_size > MAX_FILE_SIZE:
-            raise RuntimeError(
-                f"File is larger than allowed size "
-                f"({MAX_FILE_SIZE} bytes)"
-            )
-
-        await run_pantegnos(
-            input_dir,
-            output_dir,
-        )
-
-        output_files = collect_output_files(output_dir)
-
-        if not output_files:
-            raise RuntimeError(
-                "Pantegnos produced no output files."
-            )
-
-        raw_output, source_files = read_all_output(
-            output_files
-        )
-
-        links = extract_links(raw_output)
-
-        # Also search the original file when possible.
-        # This catches plaintext URI content that Pantegnos
-        # might not copy into the final text.
-        try:
-            original_bytes = input_file.read_bytes()
-
-            original_text = original_bytes.decode(
-                "utf-8",
-                errors="ignore",
-            )
-
-            for link in extract_links(original_text):
-                if link not in links:
-                    links.append(link)
-
-        except Exception as exc:
-            logger.warning(
-                "Could not scan original file: %s",
-                exc,
-            )
-
-        USER_JOBS[user_id] = {
-            "directory": str(work_dir),
-            "raw": raw_output,
-            "output": raw_output,
-            "links": links,
-            "source_files": source_files or [filename],
-        }
+        if input_file.stat().st_size > max_size:
+            raise RuntimeError("حجم فایل بیش از حد مجاز است.")
 
         await status.edit_text(
-            "✅ <b>پردازش تمام شد.</b>\n\n"
-            f"📁 فایل: <code>{escape_html(filename)}</code>\n"
-            f"🔗 لینک پیدا شده: <b>{len(links)}</b>\n\n"
-            "یکی از گزینه‌ها را انتخاب کن:",
+            "⚙️ <b>در حال پردازش...</b>\nلطفاً صبر کن.",
             parse_mode=ParseMode.HTML,
-            reply_markup=build_keyboard(user_id),
         )
 
-    except Exception as exc:
-        logger.exception("Processing failed")
+        rc, stdout, stderr = await run_engine(input_dir, output_dir)
 
-        cleanup_job(user_id)
+        if password_prompt_detected(stdout, stderr):
+            USER_JOBS[uid] = {
+                "directory": str(work_dir),
+                "raw": "",
+                "links": [],
+                "source_files": [filename],
+                "pending_password": True,
+                "input_dir": str(input_dir),
+                "output_dir": str(output_dir),
+                "job_id": job_id,
+                "filename": filename,
+            }
+            DB.finish_job(job_id, "password_required")
+            await status.edit_text(
+                "🔐 <b>این فایل رمز دارد.</b>\n\n"
+                "رمز را در پیام بعدی ارسال کن.\n"
+                "برای لغو /cancel",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if rc != 0 or not output_exists(output_dir):
+            raise RuntimeError("فایل رمزگشایی نشد یا فایل ناقص/نامعتبر است.")
+
+        raw, source_files = output_text(output_dir)
+        if not raw.strip():
+            raise RuntimeError("خروجی معتبری به دست نیامد.")
+
+        links = extract_links(raw)
+
+        USER_JOBS[uid] = {
+            "directory": str(work_dir),
+            "raw": raw,
+            "links": links,
+            "source_files": source_files or [filename],
+            "job_id": job_id,
+        }
+
+        DB.record_success(uid, len(links))
+        DB.finish_job(job_id, "success", len(links))
+
+        await status.edit_text(
+            "✅ <b>پردازش با موفقیت انجام شد.</b>\n\n"
+            f"📄 فایل: <code>{esc(filename)}</code>\n"
+            f"🔗 لینک‌های قابل استخراج: <b>{len(links)}</b>\n\n"
+            "گزینه موردنظر را انتخاب کن:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=result_menu(uid),
+        )
+
+    except Exception:
+        DB.record_failure(uid)
+        DB.finish_job(job_id, "failed", 0, "processing failed")
+        DB.refund_daily(uid)
+        cleanup_job(uid)
 
         await status.edit_text(
             "❌ <b>پردازش فایل ناموفق بود.</b>\n\n"
-            f"<code>{escape_html(str(exc)[-2500:])}</code>",
+            "فایل ممکن است خراب، ناقص، رمز اشتباه یا غیرقابل پردازش باشد.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def handle_password(update, context):
+    uid = update.effective_user.id
+    job = USER_JOBS.get(uid)
+    if not job or not job.get("pending_password"):
+        return
+
+    password = update.message.text or ""
+    if not password:
+        await update.message.reply_text("❌ رمز خالی قابل استفاده نیست.")
+        return
+
+    status = await update.message.reply_text("🔐 در حال بررسی رمز...")
+    output_dir = Path(job["output_dir"])
+    input_dir = Path(job["input_dir"])
+
+    try:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        rc, stdout, stderr = await run_engine(input_dir, output_dir, password)
+
+        if rc != 0 or not output_exists(output_dir):
+            raise RuntimeError("wrong password")
+
+        raw, source_files = output_text(output_dir)
+        if not raw.strip():
+            raise RuntimeError("empty output")
+
+        links = extract_links(raw)
+
+        job["pending_password"] = False
+        job["raw"] = raw
+        job["links"] = links
+        job["source_files"] = source_files
+        USER_JOBS[uid] = job
+
+        DB.record_success(uid, len(links))
+        DB.finish_job(job["job_id"], "success", len(links))
+
+        await status.edit_text(
+            "✅ <b>رمز صحیح بود.</b>\n\n"
+            f"🔗 لینک‌های قابل استخراج: <b>{len(links)}</b>\n\n"
+            "گزینه موردنظر را انتخاب کن:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=result_menu(uid),
+        )
+    except Exception:
+        DB.record_failure(uid)
+        DB.finish_job(job["job_id"], "failed", 0, "wrong password or invalid file")
+        DB.refund_daily(uid)
+        cleanup_job(uid)
+        await status.edit_text(
+            "❌ <b>رمز صحیح نیست یا فایل قابل پردازش نیست.</b>",
             parse_mode=ParseMode.HTML,
         )
 
 
 # ============================================================
-# Button handler
+# Result callback
 # ============================================================
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+async def result_callback(update, context):
+    q = update.callback_query
+    await q.answer()
 
-    if not query:
+    _, action, owner = q.data.split(":")
+    owner = int(owner)
+    if q.from_user.id != owner:
+        await q.answer("این نتیجه متعلق به شما نیست.", show_alert=True)
         return
 
-    await query.answer()
-
-    try:
-        action, owner_id = query.data.split(":", 1)
-        owner_id = int(owner_id)
-    except Exception:
-        await query.edit_message_text(
-            "❌ درخواست نامعتبر."
-        )
-        return
-
-    # Don't allow another user to access the job.
-    if update.effective_user.id != owner_id:
-        await query.answer(
-            "این فایل متعلق به کاربر دیگری است.",
-            show_alert=True,
-        )
-        return
-
-    job = USER_JOBS.get(owner_id)
-
+    job = USER_JOBS.get(owner)
     if not job:
-        await query.edit_message_text(
-            "⚠️ اطلاعات این فایل دیگر در حافظه بات نیست.\n"
-            "لطفاً فایل را دوباره ارسال کن."
-        )
+        await q.message.reply_text("⚠️ نتیجه دیگر در دسترس نیست. فایل را دوباره ارسال کن.")
         return
 
     links = job.get("links", [])
     raw = job.get("raw", "")
     source_files = job.get("source_files", [])
 
-    # --------------------------------------------------------
-    # Links
-    # --------------------------------------------------------
-
     if action == "links":
         if not links:
-            await query.edit_message_text(
-                "❌ هیچ لینک V2Ray/Proxy از فایل استخراج نشد.",
-                reply_markup=build_keyboard(owner_id),
+            await q.message.reply_text(
+                "❌ هیچ لینک قابل استخراجی پیدا نشد.",
+                reply_markup=result_menu(owner),
             )
             return
-
-        await query.edit_message_text(
-            f"🔗 <b>{len(links)} لینک پیدا شد.</b>\n"
-            "در حال ارسال...",
-            parse_mode=ParseMode.HTML,
-        )
-
-        text = format_links(links)
-
-        for chunk in split_message(text):
-            await query.message.reply_text(
-                chunk,
-                parse_mode=ParseMode.HTML,
+        for chunk in split_text(links_codeblock(links)):
+            await q.message.reply_text(
+                chunk, parse_mode=ParseMode.MARKDOWN_V2
             )
-
         return
-
-    # --------------------------------------------------------
-    # JSON
-    # --------------------------------------------------------
 
     if action == "json":
-        json_text = make_json(
-            links,
-            source_files,
-        )
-
-        # Telegram's text message limit.
-        if len(json_text) <= MESSAGE_LIMIT:
-            await query.edit_message_text(
-                f"<pre>{escape_html(json_text)}</pre>",
+        data = {
+            "name": "ProDecryptor",
+            "count": len(links),
+            "files": source_files,
+            "links": [
+                {"protocol": x.split("://", 1)[0].lower(), "link": x}
+                for x in links
+            ],
+        }
+        content = json.dumps(data, ensure_ascii=False, indent=2)
+        if len(content) <= TELEGRAM_CHUNK:
+            await q.message.reply_text(
+                f"<pre>{esc(content)}</pre>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_keyboard(owner_id),
+                reply_markup=result_menu(owner),
             )
         else:
-            # Send JSON as a file.
-            temporary = Path(
-                tempfile.mktemp(
-                    prefix="pantegnos-",
-                    suffix=".json",
-                )
-            )
-
+            path = Path(tempfile.mkstemp(prefix="pd-", suffix=".json")[1])
             try:
-                temporary.write_text(
-                    json_text,
-                    encoding="utf-8",
-                )
-
-                await query.edit_message_text(
-                    "📋 JSON آماده شد. در حال ارسال فایل..."
-                )
-
-                with temporary.open("rb") as file:
-                    await query.message.reply_document(
-                        document=file,
-                        filename="configs.json",
+                path.write_text(content, encoding="utf-8")
+                with path.open("rb") as f:
+                    await q.message.reply_document(
+                        f, filename="configs.json", caption="📋 JSON آماده است."
                     )
-
             finally:
-                temporary.unlink(
-                    missing_ok=True
-                )
-
+                path.unlink(missing_ok=True)
         return
-
-    # --------------------------------------------------------
-    # Info
-    # --------------------------------------------------------
 
     if action == "info":
-        info = make_info(
-            links,
-            source_files,
-        )
-
-        await query.edit_message_text(
-            info,
+        counts = protocol_counts(links)
+        lines = [
+            "🔍 <b>اطلاعات</b>",
+            "",
+            f"📄 فایل‌ها: <b>{len(source_files)}</b>",
+            f"🔗 لینک‌ها: <b>{len(links)}</b>",
+        ]
+        if counts:
+            lines += ["", "📡 <b>پروتکل‌ها:</b>"]
+            for p, c in sorted(counts.items()):
+                lines.append(f"• <code>{esc(p)}</code>: {c}")
+        await q.message.reply_text(
+            "\n".join(lines),
             parse_mode=ParseMode.HTML,
-            reply_markup=build_keyboard(owner_id),
+            reply_markup=result_menu(owner),
         )
-
         return
-
-    # --------------------------------------------------------
-    # Raw
-    # --------------------------------------------------------
 
     if action == "raw":
         if not raw:
-            await query.edit_message_text(
-                "❌ خروجی خامی وجود ندارد.",
-                reply_markup=build_keyboard(owner_id),
-            )
+            await q.message.reply_text("❌ خروجی خالی است.")
             return
-
-        temporary = Path(
-            tempfile.mktemp(
-                prefix="pantegnos-",
-                suffix=".txt",
-            )
-        )
-
+        path = Path(tempfile.mkstemp(prefix="pd-", suffix=".txt")[1])
         try:
-            temporary.write_text(
-                raw,
-                encoding="utf-8",
-            )
-
-            await query.edit_message_text(
-                "📄 خروجی خام آماده شد. در حال ارسال..."
-            )
-
-            with temporary.open("rb") as file:
-                await query.message.reply_document(
-                    document=file,
-                    filename="pantegnos-output.txt",
+            path.write_text(raw, encoding="utf-8")
+            with path.open("rb") as f:
+                await q.message.reply_document(
+                    f, filename="output.txt", caption="📄 خروجی آماده است."
                 )
-
         finally:
-            temporary.unlink(
-                missing_ok=True
-            )
-
+            path.unlink(missing_ok=True)
         return
-
-    # --------------------------------------------------------
-    # Delete
-    # --------------------------------------------------------
 
     if action == "delete":
-        cleanup_job(owner_id)
-
-        await query.edit_message_text(
-            "🗑 اطلاعات و فایل موقت حذف شد."
+        cleanup_job(owner)
+        await q.message.reply_text(
+            "🗑 نتیجه حذف شد.",
+            reply_markup=user_menu(),
         )
 
+
+# ============================================================
+# Admin dashboard
+# ============================================================
+
+async def admin_command(update, context):
+    if not admin_only(update.effective_user.id):
+        return
+    DB.upsert_user(update.effective_user)
+    await update.message.reply_text(
+        "🛡 <b>ProDecryptor Admin</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu(),
+    )
+
+
+async def admin_callback(update, context):
+    q = update.callback_query
+    if not admin_only(q.from_user.id):
+        await q.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await q.answer()
+
+    d = q.data
+
+    if d == "admin:dashboard":
+        await admin_dashboard(q)
+    elif d == "admin:limits":
+        await admin_limits(q)
+    elif d == "admin:broadcast":
+        ADMIN_STATE[ADMIN_ID] = {"type": "broadcast"}
+        await q.message.reply_text(
+            "📣 پیام همگانی را ارسال کن.\nبرای لغو /cancel",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❎ لغو", callback_data="admin:cancel", style="danger")]
+            ]),
+        )
+    elif d == "admin:sponsors":
+        await admin_sponsors(q)
+    elif d == "admin:sponsor:add":
+        ADMIN_STATE[ADMIN_ID] = {"type": "sponsor", "mode": "add", "step": "name", "data": {}}
+        await q.message.reply_text(
+            "🤝 <b>ساخت اسپانسر</b>\n\nمرحله 1 از 4\nنام اسپانسر را ارسال کن.",
+            parse_mode=ParseMode.HTML,
+        )
+    elif d.startswith("admin:sponsor:edit:"):
+        sid = int(d.rsplit(":", 1)[1])
+        s = DB.sponsor(sid)
+        if not s:
+            await admin_sponsors(q)
+            return
+        ADMIN_STATE[ADMIN_ID] = {
+            "type": "sponsor", "mode": "edit", "step": "name",
+            "sponsor_id": sid,
+            "data": {
+                "name": s["name"], "url": s["url"],
+                "button_text": s["button_text"], "style": s["style"],
+            },
+        }
+        await q.message.reply_text(
+            f"✏️ <b>ویرایش #{sid}</b>\n\n"
+            "مرحله 1 از 4\nنام جدید را ارسال کن.\n"
+            "اگر می‌خواهی همان نام بماند، همان نام را ارسال کن.",
+            parse_mode=ParseMode.HTML,
+        )
+    elif d.startswith("admin:sponsor:toggle:"):
+        sid = int(d.rsplit(":", 1)[1])
+        s = DB.sponsor(sid)
+        if s:
+            DB.set_sponsor_active(sid, not bool(s["active"]))
+        await admin_sponsors(q)
+    elif d.startswith("admin:sponsor:delete:"):
+        sid = int(d.rsplit(":", 1)[1])
+        DB.delete_sponsor(sid)
+        await admin_sponsors(q)
+    elif d == "admin:sponsor:up":
+        pass
+    elif d == "admin:status":
+        await admin_status(q)
+    elif d == "admin:jobs":
+        await admin_jobs(q)
+    elif d == "admin:settings":
+        await admin_settings(q)
+    elif d == "admin:cancel":
+        ADMIN_STATE.pop(ADMIN_ID, None)
+        await q.message.reply_text("❎ لغو شد.", reply_markup=admin_menu())
+    elif d.startswith("admin:limit:set:"):
+        value = d.rsplit(":", 1)[1]
+        DB.set_setting("daily_limit", value)
+        await admin_limits(q)
+    elif d == "admin:maintenance:toggle":
+        DB.set_setting("maintenance", "0" if maintenance_on() else "1")
+        await admin_limits(q)
+    elif d.startswith("admin:maxsize:"):
+        value = int(d.rsplit(":", 1)[1])
+        DB.set_setting("max_file_size", str(value))
+        await admin_settings(q)
+    elif d.startswith("admin:timeout:"):
+        value = int(d.rsplit(":", 1)[1])
+        DB.set_setting("process_timeout", str(value))
+        await admin_settings(q)
+    elif d.startswith("admin:users:"):
+        await admin_users(q, int(d.rsplit(":", 1)[1]))
+    elif d.startswith("admin:user:view:"):
+        await admin_user_view(q, int(d.rsplit(":", 1)[1]))
+    elif d.startswith("admin:user:block:"):
+        uid = int(d.rsplit(":", 1)[1])
+        if uid != ADMIN_ID:
+            DB.set_blocked(uid, True)
+        await admin_user_view(q, uid)
+    elif d.startswith("admin:user:unblock:"):
+        uid = int(d.rsplit(":", 1)[1])
+        DB.set_blocked(uid, False)
+        await admin_user_view(q, uid)
+    elif d.startswith("admin:user:jobs:"):
+        await admin_user_jobs(q, int(d.rsplit(":", 1)[1]))
+
+
+async def admin_dashboard(q):
+    s = DB.stats()
+    limit = int(DB.setting("daily_limit", "5"))
+    await q.message.edit_text(
+        "📊 <b>داشبورد مدیریت</b>\n\n"
+        f"👥 کاربران: <b>{s['users']}</b>\n"
+        f"🟢 فعال 24 ساعت: <b>{s['active']}</b>\n"
+        f"⛔ مسدود: <b>{s['blocked']}</b>\n\n"
+        f"📁 فایل‌ها: <b>{s['files']}</b>\n"
+        f"✅ موفق: <b>{s['success']}</b>\n"
+        f"❌ ناموفق: <b>{s['failed']}</b>\n"
+        f"🔗 لینک‌ها: <b>{s['links']}</b>\n"
+        f"⚡ عملیات 24 ساعت: <b>{s['jobs24']}</b>\n\n"
+        f"📅 سهمیه روزانه: <b>{'∞' if limit == 0 else limit}</b>\n"
+        f"🛠 تعمیر: <b>{'فعال' if maintenance_on() else 'خاموش'}</b>\n"
+        f"🕐 {now_text()}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu(),
+    )
+
+
+async def admin_limits(q):
+    limit = int(DB.setting("daily_limit", "5"))
+    maintenance = maintenance_on()
+    rows = [
+        [
+            InlineKeyboardButton("1", callback_data="admin:limit:set:1", style="primary"),
+            InlineKeyboardButton("3", callback_data="admin:limit:set:3", style="primary"),
+            InlineKeyboardButton("5", callback_data="admin:limit:set:5", style="primary"),
+            InlineKeyboardButton("10", callback_data="admin:limit:set:10", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("20", callback_data="admin:limit:set:20", style="primary"),
+            InlineKeyboardButton("50", callback_data="admin:limit:set:50", style="primary"),
+            InlineKeyboardButton("∞", callback_data="admin:limit:set:0", style="success"),
+        ],
+        [
+            InlineKeyboardButton(
+                "🛠 روشن" if not maintenance else "🟢 خاموش",
+                callback_data="admin:maintenance:toggle",
+                style="danger" if not maintenance else "success",
+            )
+        ],
+        [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")],
+    ]
+    await q.message.edit_text(
+        "⚙️ <b>سهمیه و محدودیت</b>\n\n"
+        f"سقف فعلی هر کاربر: <b>{'∞' if limit == 0 else limit}</b> فایل در روز\n"
+        f"حالت تعمیر: <b>{'فعال' if maintenance else 'خاموش'}</b>\n\n"
+        "سهمیه با زمان UTC روزانه محاسبه می‌شود.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def admin_settings(q):
+    size = int(DB.setting("max_file_size", str(DEFAULT_MAX_FILE_SIZE)))
+    timeout = int(DB.setting("process_timeout", str(DEFAULT_PROCESS_TIMEOUT)))
+    await q.message.edit_text(
+        "⚙️ <b>تنظیمات سرویس</b>\n\n"
+        f"📦 حجم فعلی: <b>{file_size_text(size)}</b>\n"
+        f"⏱ زمان پردازش: <b>{timeout} ثانیه</b>\n"
+        f"⚡ پردازش همزمان: <b>{MAX_CONCURRENT_JOBS}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("10MB", callback_data=f"admin:maxsize:{10*1024*1024}", style="primary"),
+                InlineKeyboardButton("25MB", callback_data=f"admin:maxsize:{25*1024*1024}", style="primary"),
+                InlineKeyboardButton("50MB", callback_data=f"admin:maxsize:{50*1024*1024}", style="primary"),
+            ],
+            [
+                InlineKeyboardButton("100MB", callback_data=f"admin:maxsize:{100*1024*1024}", style="primary"),
+                InlineKeyboardButton("30s", callback_data="admin:timeout:30", style="primary"),
+                InlineKeyboardButton("60s", callback_data="admin:timeout:60", style="primary"),
+                InlineKeyboardButton("120s", callback_data="admin:timeout:120", style="primary"),
+            ],
+            [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")],
+        ]),
+    )
+
+
+async def admin_status(q):
+    engine = os.path.isfile(PANTEGNOS_BIN)
+    await q.message.edit_text(
+        "🛠 <b>وضعیت سرویس</b>\n\n"
+        f"🤖 ProDecryptor: <b>فعال</b>\n"
+        f"⚙️ موتور پردازش: <b>{'آماده' if engine else 'یافت نشد'}</b>\n"
+        f"💾 دیتابیس: <code>{esc(DB_PATH)}</code>\n"
+        f"📦 حجم: <b>{file_size_text(int(DB.setting('max_file_size', str(DEFAULT_MAX_FILE_SIZE))) )}</b>\n"
+        f"⏱ timeout: <b>{DB.setting('process_timeout', str(DEFAULT_PROCESS_TIMEOUT))}s</b>\n"
+        f"⚡ همزمانی: <b>{MAX_CONCURRENT_JOBS}</b>\n"
+        f"🕐 {now_text()}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 بروزرسانی", callback_data="admin:status", style="success")],
+            [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")],
+        ]),
+    )
+
+
+async def admin_jobs(q):
+    jobs = DB.recent_jobs()
+    lines = ["🧾 <b>آخرین عملیات</b>", ""]
+    for j in jobs:
+        icon = {
+            "success": "✅", "failed": "❌",
+            "processing": "⏳", "password_required": "🔐"
+        }.get(j["status"], "•")
+        dt = datetime.fromtimestamp(j["created_at"], timezone.utc).strftime("%m-%d %H:%M")
+        lines.append(
+            f"{icon} <code>{esc(j['filename'])}</code> | "
+            f"{j['user_id']} | {j['links_count']} لینک | {dt}"
+        )
+    if len(lines) == 2:
+        lines.append("هنوز عملیاتی ثبت نشده است.")
+    await q.message.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")]
+        ]),
+    )
+
+
+async def admin_users(q, page):
+    users = DB.users_page(page)
+    total = DB.user_count()
+    lines = [f"👥 <b>کاربران</b> — صفحه {page+1}", f"کل: <b>{total}</b>", ""]
+    rows = []
+
+    for u in users:
+        name = u["username"] or u["first_name"] or str(u["user_id"])
+        icon = "⛔" if u["is_blocked"] else "🟢"
+        lines.append(
+            f"{icon} <b>{esc(name)}</b> | <code>{u['user_id']}</code> | "
+            f"فایل {u['total_files']} | لینک {u['total_links']}"
+        )
+        rows.append([
+            InlineKeyboardButton(
+                f"👤 {u['user_id']}",
+                callback_data=f"admin:user:view:{u['user_id']}",
+                style="primary",
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"admin:users:{page-1}", style="primary"))
+    if (page + 1) * 8 < total:
+        nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"admin:users:{page+1}", style="primary"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")])
+
+    await q.message.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def admin_user_view(q, user_id):
+    u = DB.get_user(user_id)
+    if not u:
+        await q.message.edit_text("کاربر پیدا نشد.", reply_markup=admin_menu())
         return
 
+    name = " ".join(x for x in [u["first_name"], u["last_name"]] if x).strip()
+    username = f"@{u['username']}" if u["username"] else "ندارد"
+    limit = int(DB.setting("daily_limit", "5"))
+    used = DB.daily_usage(user_id)
 
-# ============================================================
-# Error handler
-# ============================================================
+    await q.message.edit_text(
+        "👤 <b>جزئیات کاربر</b>\n\n"
+        f"🆔 <code>{u['user_id']}</code>\n"
+        f"👤 {esc(name or 'بدون نام')}\n"
+        f"🔹 {esc(username)}\n"
+        f"📅 امروز: <b>{used} / {'∞' if limit == 0 else limit}</b>\n\n"
+        f"📁 کل فایل‌ها: <b>{u['total_files']}</b>\n"
+        f"✅ موفق: <b>{u['successful_files']}</b>\n"
+        f"❌ ناموفق: <b>{u['failed_files']}</b>\n"
+        f"🔗 لینک‌ها: <b>{u['total_links']}</b>\n"
+        f"🔒 وضعیت: <b>{'مسدود' if u['is_blocked'] else 'فعال'}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🟢 رفع مسدودیت" if u["is_blocked"] else "⛔ مسدود",
+                    callback_data=f"admin:user:{'unblock' if u['is_blocked'] else 'block'}:{user_id}",
+                    style="success" if u["is_blocked"] else "danger",
+                ),
+                InlineKeyboardButton(
+                    "🧾 عملیات", callback_data=f"admin:user:jobs:{user_id}", style="primary"
+                ),
+            ],
+            [InlineKeyboardButton("🔙 کاربران", callback_data="admin:users:0", style="primary")],
+        ]),
+    )
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    logger.exception(
-        "Unhandled exception",
-        exc_info=context.error,
+
+async def admin_user_jobs(q, user_id):
+    rows = DB.conn.execute(
+        "SELECT * FROM jobs WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
+        (user_id,),
+    ).fetchall()
+    lines = [f"🧾 <b>عملیات کاربر {user_id}</b>", ""]
+    for j in rows:
+        icon = "✅" if j["status"] == "success" else "❌" if j["status"] == "failed" else "🔐"
+        lines.append(
+            f"{icon} <code>{esc(j['filename'])}</code> | "
+            f"{j['links_count']} لینک"
+        )
+    if len(lines) == 2:
+        lines.append("عملیاتی ثبت نشده است.")
+    await q.message.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 کاربر", callback_data=f"admin:user:view:{user_id}", style="primary")]
+        ]),
+    )
+
+
+async def admin_sponsors(q):
+    sponsors = DB.sponsors(False)
+    lines = ["🤝 <b>مدیریت اسپانسرها</b>", ""]
+    if not sponsors:
+        lines.append("هنوز اسپانسری ثبت نشده است.")
+
+    rows = []
+    for s in sponsors:
+        state = "🟢" if s["active"] else "⚪"
+        lines.append(
+            f"{state} <b>{esc(s['button_text'])}</b> | "
+            f"{esc(s['style'])} | #{s['id']}"
+        )
+        rows.append([
+            InlineKeyboardButton(
+                f"✏️ #{s['id']}",
+                callback_data=f"admin:sponsor:edit:{s['id']}",
+                style="primary",
+            ),
+            InlineKeyboardButton(
+                "🟢 فعال" if s["active"] else "⚪ غیرفعال",
+                callback_data=f"admin:sponsor:toggle:{s['id']}",
+                style="success" if s["active"] else "primary",
+            ),
+            InlineKeyboardButton(
+                "🗑",
+                callback_data=f"admin:sponsor:delete:{s['id']}",
+                style="danger",
+            ),
+        ])
+
+    rows.append([
+        InlineKeyboardButton("➕ ساخت اسپانسر", callback_data="admin:sponsor:add", style="success")
+    ])
+    rows.append([
+        InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")
+    ])
+
+    await q.message.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
     )
 
 
 # ============================================================
-# Main
+# Admin state: broadcast + sponsor wizard
 # ============================================================
 
-def main():
-    ensure_configured()
+async def handle_admin_state(update, context):
+    state = ADMIN_STATE.get(ADMIN_ID)
+    if not state:
+        return
 
-    application = (
+    if state["type"] == "broadcast":
+        text = update.message.text or ""
+        ADMIN_STATE.pop(ADMIN_ID, None)
+
+        users = DB.conn.execute(
+            "SELECT user_id FROM users WHERE is_blocked=0"
+        ).fetchall()
+
+        sent = failed = 0
+        status = await update.message.reply_text("📣 ارسال همگانی شروع شد...")
+        for row in users:
+            try:
+                await context.bot.send_message(row["user_id"], text)
+                sent += 1
+            except (Forbidden, TelegramError):
+                failed += 1
+            await asyncio.sleep(0.03)
+
+        await status.edit_text(
+            f"📣 <b>ارسال تمام شد.</b>\n\n"
+            f"✅ موفق: <b>{sent}</b>\n"
+            f"❌ ناموفق: <b>{failed}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu(),
+        )
+        return
+
+    if state["type"] != "sponsor":
+        return
+
+    value = (update.message.text or "").strip()
+    if not value:
+        await update.message.reply_text("❌ مقدار خالی است.")
+        return
+
+    data = state["data"]
+    step = state["step"]
+
+    if step == "name":
+        data["name"] = value
+        state["step"] = "url"
+        await update.message.reply_text(
+            "مرحله 2 از 4\nلینک اسپانسر را ارسال کن."
+        )
+    elif step == "url":
+        if not value.startswith(("https://", "http://", "tg://")):
+            await update.message.reply_text("❌ لینک نامعتبر است.")
+            return
+        data["url"] = value
+        state["step"] = "button"
+        await update.message.reply_text("مرحله 3 از 4\nمتن دکمه را ارسال کن.")
+    elif step == "button":
+        if len(value) > 64:
+            await update.message.reply_text("❌ متن دکمه حداکثر 64 کاراکتر است.")
+            return
+        data["button_text"] = value
+        state["step"] = "style"
+        await update.message.reply_text(
+            "مرحله 4 از 4\nاستایل را انتخاب کن:",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🔵 Primary", callback_data="sponsorstyle:primary", style="primary"),
+                    InlineKeyboardButton("🟢 Success", callback_data="sponsorstyle:success", style="success"),
+                    InlineKeyboardButton("🔴 Danger", callback_data="sponsorstyle:danger", style="danger"),
+                ],
+                [InlineKeyboardButton("❎ لغو", callback_data="admin:cancel", style="danger")],
+            ]),
+        )
+
+
+async def sponsor_style_callback(update, context):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await q.answer()
+
+    state = ADMIN_STATE.get(ADMIN_ID)
+    if not state or state.get("type") != "sponsor":
+        return
+
+    style = q.data.split(":", 1)[1]
+    data = state["data"]
+
+    if state["mode"] == "add":
+        sid = DB.add_sponsor(
+            data["name"], data["url"], data["button_text"], style, True
+        )
+        message = f"✅ اسپانسر #{sid} ساخته و فعال شد."
+    else:
+        DB.update_sponsor(
+            state["sponsor_id"],
+            data["name"], data["url"], data["button_text"], style
+        )
+        message = f"✅ اسپانسر #{state['sponsor_id']} بروزرسانی شد."
+
+    ADMIN_STATE.pop(ADMIN_ID, None)
+
+    await q.message.edit_text(
+        message,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤝 مدیریت اسپانسرها", callback_data="admin:sponsors", style="primary")],
+            [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")],
+        ]),
+    )
+
+
+# ============================================================
+# Errors / lifecycle
+# ============================================================
+
+async def error_handler(update, context):
+    log.exception("Unhandled exception", exc_info=context.error)
+
+
+async def post_init(application):
+    DB.open()
+    log.info("Database: %s", DB_PATH)
+    log.info("Engine: %s", PANTEGNOS_BIN)
+
+
+async def post_shutdown(application):
+    for uid in list(USER_JOBS):
+        cleanup_job(uid)
+    DB.close()
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
-    application.add_handler(
-        CommandHandler("start", start)
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("cancel", cancel))
 
-    application.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            handle_document,
-        )
-    )
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(result_callback, pattern=r"^result:"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(sponsor_style_callback, pattern=r"^sponsorstyle:"))
 
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_text,
-        )
-    )
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    application.add_handler(
-        CallbackQueryHandler(button_handler)
-    )
+    app.add_error_handler(error_handler)
 
-    application.add_error_handler(
-        error_handler
-    )
-
-    logger.info(
-        "Bot started. Pantegnos: %s",
-        PANTEGNOS_BIN,
-    )
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-    )
+    log.info("Starting ProDecryptor")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
