@@ -30,8 +30,11 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ProDecryptor - single-file Telegram bot | v3
+# ProDecryptor - single-file Telegram bot | v1.0.0
 # ============================================================
+
+APP_VERSION = "1.0.0"
+APP_NAME = "ProDecryptor"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = 5728292317
@@ -60,18 +63,27 @@ SUPPORTED_EXTENSIONS = {
     ".slip", ".ehi", ".dark", ".hat", ".npvt", ".npvs", ".nm", ".happ",
 }
 
+# Feature switches (controlled from database/admin in future releases)
+# 1 = enabled, 0 = disabled
+FORMAT_FEATURES = {
+    "vless": "feature_vless",
+    "vmess": "feature_vmess",
+    "trojan": "feature_trojan",
+    "ss": "feature_ss",
+    "socks": "feature_socks",
+    "hysteria": "feature_hysteria",
+    "tuic": "feature_tuic",
+    "wireguard": "feature_wireguard",
+    "ssh": "feature_ssh",
+}
+
 URI_SCHEMES = (
     "vless://", "vmess://", "trojan://", "ss://", "socks://", "socks5://",
     "hysteria://", "hysteria2://", "hy2://", "tuic://", "wireguard://", "ssh://",
-    "slipnet://", "slipnet-enc://", "slipnet-bundle-enc://",
-    "darktunnel://", "happ://",
 )
 
-# Standard URIs plus client-specific schemes emitted by the decoder engine.
-# nm-* is intentionally open-ended because NetMod has more than one URI variant.
 URL_RE = re.compile(
-    r"(?i)(?:vless|vmess|trojan|ss|socks5?|hysteria2?|hy2|tuic|wireguard|ssh|"
-    r"slipnet(?:-bundle-enc|-enc)?|darktunnel|happ|nm-[a-z0-9_-]+)://[^\s<>\[\]{}\"']+"
+    r"(?i)(?:vless|vmess|trojan|ss|socks5?|hysteria2?|hy2|tuic|wireguard|ssh)://[^\s<>\[\]{}\"']+"
 )
 
 logging.basicConfig(
@@ -212,6 +224,15 @@ class Database:
             "process_timeout": str(DEFAULT_PROCESS_TIMEOUT),
             "captcha_interval": "10",
             "captcha_max_attempts": "5",
+            "feature_vless": "1",
+            "feature_vmess": "1",
+            "feature_trojan": "1",
+            "feature_ss": "1",
+            "feature_socks": "1",
+            "feature_hysteria": "1",
+            "feature_tuic": "1",
+            "feature_wireguard": "1",
+            "feature_ssh": "1",
         }
         for k, v in defaults.items():
             self.conn.execute(
@@ -552,13 +573,20 @@ JSON_KEY_RE = re.compile(
 
 
 def extract_links(text):
-    """Return ONLY real proxy/config URIs. Plain UUIDs, hosts and random tokens are not links."""
+    """Protocol aware URI extraction. Never treats UUID/IP/hostname as links."""
     found, seen = [], set()
+    enabled = {}
+    for proto, key in FORMAT_FEATURES.items():
+        enabled[proto] = DB.setting(key, "1") == "1" if "DB" in globals() else True
+
     for match in URL_RE.findall(text or ""):
         value = normalize_link(match)
-        if not value:
+        if not value or "://" not in value:
             continue
-        if value.lower().startswith(URI_SCHEMES) and value not in seen:
+        proto = value.split("://", 1)[0].lower()
+        if proto in enabled and not enabled[proto]:
+            continue
+        if proto in FORMAT_FEATURES and value not in seen:
             seen.add(value)
             found.append(value)
     return found
@@ -621,80 +649,67 @@ def _first(d, *names):
 
 
 def build_vless_from_v2ray_profile(profile, remarks=None):
-    """Build a VLESS URI from NPV Tunnel or NetMod structured profiles."""
+    """Build a VLESS URI from the structured NPV Tunnel/V2Ray profile emitted by the engine.
+
+    This is intentionally conservative: it only builds a URI when the profile contains
+    the server, port and UUID-like credential needed by this schema.
+    """
     if not isinstance(profile, dict):
         return None
 
-    # NetMod .nm exports use these capitalized keys; NPV Tunnel uses the
-    # lower-case variants. Accept both without changing the original values.
-    protocol = _first(profile, "Protocol", "protocol")
-    if protocol is not None and str(protocol).strip().lower() != "vless":
-        return None
-
-    server = _first(profile, "server", "Hostname", "hostname", "address", "host")
-    port = _first(profile, "serverPort", "Port", "port")
-    user_id = _first(profile, "uuid", "id", "password", "UserID", "userId")
+    server = _first(profile, "server", "address", "host")
+    port = _first(profile, "serverPort", "port")
+    user_id = _first(profile, "uuid", "id", "password")
     if not server or not port or not user_id:
         return None
+
     try:
         port = int(port)
     except (TypeError, ValueError):
         return None
 
-    network = _first(profile, "TransferProtocol", "transferProtocol", "network", "type")
-    security = _first(profile, "TLSType", "tlsType", "security")
-    host = _first(profile, "Host", "hostHeader")
-    path = _first(profile, "Path", "path")
-    sni = _first(profile, "SNI", "sni", "serverName")
-    alpn = _first(profile, "Alpn", "alpn")
-    fingerprint = _first(profile, "FingerPrint", "fingerPrint", "fingerprint", "fp")
-    method = _first(profile, "EncryptMethod", "encryptMethod", "method", "encryption")
-    flow = _first(profile, "Flow", "flow")
-
+    # NPV Tunnel's exported V2Ray profile uses password as the VLESS UUID,
+    # and method as the encryption value in the generated URI.
     query = []
-    if network is not None and str(network).strip().lower() not in ("", "none"):
-        n = str(network).strip().lower()
-        if n == "websocket":
-            n = "ws"
-        query.append(("type", n))
-    if security is not None and str(security).strip().lower() not in ("", "none"):
-        query.append(("security", str(security)))
-    if host is not None and str(host).strip():
-        query.append(("host", str(host)))
-    if path is not None and str(path).strip():
-        query.append(("path", str(path)))
-    if fingerprint is not None and str(fingerprint).strip() and str(fingerprint).lower() != "none":
-        query.append(("fp", str(fingerprint)))
-    if sni is not None and str(sni).strip():
-        query.append(("sni", str(sni)))
-    if alpn is not None and str(alpn).strip() and str(alpn).lower() != "none":
-        query.append(("alpn", str(alpn)))
-    if flow is not None and str(flow).strip() and str(flow).lower() != "none":
-        query.append(("flow", str(flow)))
-    if method is not None and str(method).strip() and str(method).lower() != "none":
-        query.append(("encryption", str(method)))
+    method = _first(profile, "method", "encryption")
+    network = _first(profile, "network", "type")
+    security = _first(profile, "security")
+    sni = _first(profile, "sni", "serverName")
+    alpn = _first(profile, "alpn")
+    fingerprint = _first(profile, "fingerPrint", "fingerprint", "fp")
 
-    # VLESS WebSocket links generated by the reference client use this field.
-    if network is not None and str(network).strip().lower() in ("ws", "websocket"):
-        query.append(("headerType", "none"))
+    if method is not None:
+        query.append(("encryption", str(method)))
+    if network is not None:
+        query.append(("type", str(network)))
+    if security is not None:
+        query.append(("security", str(security)))
+    if sni is not None:
+        query.append(("sni", str(sni)))
+    if alpn is not None:
+        query.append(("alpn", str(alpn)))
+    if fingerprint is not None:
+        query.append(("fp", str(fingerprint)))
 
     insecure = _boolish(_first(profile, "insecure", "allowInsecure"))
     if insecure:
         query.append(("insecure", "1"))
+        # This schema's insecure=true is represented by both flags by the
+        # expected VLESS URI format used by the user's NPV Tunnel output.
         query.append(("allowInsecure", "1"))
 
     uri = "vless://" + quote(str(user_id), safe="") + "@" + str(server) + ":" + str(port)
     if query:
         uri += "?" + urlencode(query)
 
-    remark = remarks or _first(profile, "Remark", "remarks", "remark", "name", "title")
+    remark = remarks
     if remark is not None and str(remark).strip():
         uri += "#" + quote(str(remark).strip(), safe="")
     return uri
 
 
 def extract_structured_uris(text):
-    """Extract ready URIs and reconstruct VLESS from supported JSON exports."""
+    """Extract ready URIs and reconstruct supported V2Ray/NVP profiles when needed."""
     found, seen = [], set()
 
     def add(uri):
@@ -707,37 +722,29 @@ def extract_structured_uris(text):
 
     def walk(value, inherited_remarks=None):
         if isinstance(value, dict):
-            remarks = _first(value, "Remark", "remarks", "remark", "name", "title") or inherited_remarks
-
+            remarks = _first(value, "remarks", "remark", "name", "title") or inherited_remarks
+            # Some exports wrap the actual profile in v2rayProfile.
             profile = value.get("v2rayProfile")
             if isinstance(profile, dict):
                 add(build_vless_from_v2ray_profile(profile, remarks))
-
-            # NetMod .nm commonly stores profiles under Common[].
-            if isinstance(value.get("Common"), list):
-                for child in value["Common"]:
-                    walk(child, remarks)
-
-            # A direct NetMod/NPV VLESS profile.
-            if _first(value, "Protocol", "protocol") is not None:
+                # Do not recurse into this profile again; it would duplicate the same URI.
+                for key, child in value.items():
+                    if key == "v2rayProfile":
+                        continue
+                    if isinstance(child, (dict, list)):
+                        walk(child, remarks)
+                return
+            # Also support a profile object directly.
+            if all(k in value for k in ("server",)):
                 add(build_vless_from_v2ray_profile(value, remarks))
-            elif _first(value, "server", "Hostname", "hostname", "address", "host") is not None:
-                add(build_vless_from_v2ray_profile(value, remarks))
-
-            for key, child in value.items():
-                if key == "Common":
-                    continue
+            for child in value.values():
                 if isinstance(child, (dict, list)):
                     walk(child, remarks)
         elif isinstance(value, list):
             for child in value:
                 walk(child, inherited_remarks)
 
-    # First find ordinary URI strings, including NetMod nm-* schemes.
-    for uri in URL_RE.findall(text or ""):
-        add(uri)
-    # Then parse embedded JSON objects and reconstruct structured profiles.
-    for value in iter_json_values(text or ""):
+    for value in iter_json_values(text):
         walk(value)
 
     return found
@@ -827,37 +834,20 @@ def user_menu():
     return InlineKeyboardMarkup(rows)
 
 
-def client_output_label(ext):
-    return {
-        ".slip": "📱 خروجی SlipNet",
-        ".ehi": "📱 خروجی HTTP Injector",
-        ".dark": "📱 خروجی DarkTunnel",
-        ".hat": "📱 خروجی HA Tunnel Plus",
-        ".npvt": "📱 خروجی NPV Tunnel",
-        ".npvs": "📱 خروجی NPV Tunnel",
-        ".nm": "📱 خروجی NetMod",
-        ".happ": "📱 خروجی Happ Proxy",
-    }.get((ext or "").lower(), "📄 خروجی فایل")
-
-
 def result_menu(user_id):
-    job = USER_JOBS.get(user_id, {})
-    links = job.get("links", [])
-    raw = job.get("raw", "")
-    ext = job.get("extension", "")
-
-    rows = []
-    if links:
-        rows.append([
+    rows = [
+        [
             InlineKeyboardButton("🔗 لینک‌ها", callback_data=f"result:links:{user_id}", style="success"),
-        ])
-    if raw:
-        rows.append([
-            InlineKeyboardButton(client_output_label(ext), callback_data=f"result:client:{user_id}", style="primary"),
-        ])
-    if not rows:
-        rows.append([InlineKeyboardButton("📄 خروجی فایل", callback_data=f"result:client:{user_id}", style="primary")])
-    rows.append([InlineKeyboardButton("🗑 حذف", callback_data=f"result:delete:{user_id}", style="danger")])
+            InlineKeyboardButton("📋 JSON", callback_data=f"result:json:{user_id}", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("🔍 اطلاعات", callback_data=f"result:info:{user_id}", style="primary"),
+            InlineKeyboardButton("📄 خروجی", callback_data=f"result:raw:{user_id}", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("🗑 حذف", callback_data=f"result:delete:{user_id}", style="danger"),
+        ],
+    ]
     rows.extend(sponsor_rows())
     return InlineKeyboardMarkup(rows)
 
@@ -1168,7 +1158,6 @@ async def handle_text(update, context):
         "raw": update.message.text,
         "links": links,
         "source_files": ["پیام"],
-        "extension": "",
         "keys": extract_labeled_keys(update.message.text or ""),
     }
     if uid != ADMIN_ID:
@@ -1370,7 +1359,6 @@ async def handle_document(update, context):
                     "raw": content,
                     "links": links,
                     "source_files": [filename],
-                    "extension": ext,
                 }
                 await update.message.reply_text(
                     f"✅ <b>{len(links)}</b> لینک پیدا شد.\n\nانتخاب کن:",
@@ -1435,13 +1423,18 @@ async def handle_document(update, context):
             raise RuntimeError(engine_failure_reason(rc, stdout, stderr, ext))
 
         raw, source_files = output_text(output_dir)
-        if not raw.strip():
+        # Parse every engine output source, not only text files.
+        combined_engine_output = stdout + "\n" + raw
+        json_links = extract_structured_uris(combined_engine_output)
+        if json_links:
+            log.info("structured engine links found: %s", len(json_links))
+        if not raw.strip() and not json_links:
             raise RuntimeError("خروجی معتبری به دست نیامد.")
 
         # NPVT may put only UUID/host in the TXT output while printing the
         # complete structured V2Ray profile to engine stdout. Parse both.
         links = extract_links(raw)
-        for link in extract_structured_uris(stdout):
+        for link in json_links if 'json_links' in locals() else extract_structured_uris(stdout):
             if link not in links:
                 links.append(link)
 
@@ -1450,7 +1443,6 @@ async def handle_document(update, context):
             "raw": raw,
             "links": links,
             "source_files": source_files or [filename],
-            "extension": ext,
             "job_id": job_id,
         }
 
@@ -1519,7 +1511,6 @@ async def handle_password(update, context):
         job["raw"] = raw
         job["links"] = links
         job["source_files"] = source_files
-        job.setdefault("extension", Path(source_files[0]).suffix.lower() if source_files else "")
         USER_JOBS[uid] = job
 
         DB.record_success(uid, len(links))
@@ -1585,20 +1576,66 @@ async def result_callback(update, context):
         await q.message.reply_text("🔗 پایان فهرست لینک‌ها", reply_markup=result_menu(owner))
         return
 
-    if action == "client":
+    if action == "json":
+        data = {
+            "name": "ProDecryptor",
+            "count": len(links),
+            "files": source_files,
+            "keys": job.get("keys", extract_labeled_keys(raw)),
+            "links": [
+                {"protocol": x.split("://", 1)[0].lower(), "link": x}
+                for x in links
+            ],
+        }
+        content = json.dumps(data, ensure_ascii=False, indent=2)
+        if len(content) <= TELEGRAM_CHUNK:
+            await q.message.reply_text(
+                f"<pre>{esc(content)}</pre>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=result_menu(owner),
+            )
+        else:
+            path = Path(tempfile.mkstemp(prefix="pd-", suffix=".json")[1])
+            try:
+                path.write_text(content, encoding="utf-8")
+                with path.open("rb") as f:
+                    await q.message.reply_document(
+                        f, filename="configs.json", caption="📋 JSON آماده است."
+                    )
+                await q.message.reply_text("📋 پایان JSON", reply_markup=result_menu(owner))
+            finally:
+                path.unlink(missing_ok=True)
+        return
+
+    if action == "info":
+        counts = protocol_counts(links)
+        lines = [
+            "🔍 <b>اطلاعات</b>",
+            "",
+            f"📄 فایل‌ها: <b>{len(source_files)}</b>",
+            f"🔗 لینک‌ها: <b>{len(links)}</b>",
+        ]
+        if counts:
+            lines += ["", "📡 <b>پروتکل‌ها:</b>"]
+            for p, c in sorted(counts.items()):
+                lines.append(f"• <code>{esc(p)}</code>: {c}")
+        await q.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=result_menu(owner),
+        )
+        return
+
+    if action == "raw":
         if not raw:
-            await q.message.reply_text("❌ خروجی فایل خالی است.", reply_markup=result_menu(owner))
+            await q.message.reply_text("❌ خروجی خالی است.")
             return
-        ext = job.get("extension", "")
-        label = client_output_label(ext)
-        stem = Path(source_files[0]).stem if source_files else "output"
-        filename = f"{stem}.txt"
-        path = Path(tempfile.mkstemp(prefix="pd-client-", suffix=".txt")[1])
+        path = Path(tempfile.mkstemp(prefix="pd-", suffix=".txt")[1])
         try:
             path.write_text(raw, encoding="utf-8")
             with path.open("rb") as f:
                 await q.message.reply_document(
-                    f, filename=filename, caption=f"{label} آماده است."
+                    f, filename="output.txt", caption="📄 خروجی آماده است."
                 )
         finally:
             path.unlink(missing_ok=True)
@@ -2359,7 +2396,7 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    log.info("Starting ProDecryptor v3")
+    log.info("Starting ProDecryptor v1")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
