@@ -31,10 +31,10 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ProDecryptor - single-file Telegram bot | v1.1.0
+# ProDecryptor - single-file Telegram bot | v1.4.0
 # ============================================================
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.4.0"
 APP_NAME = "ProDecryptor"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -236,6 +236,17 @@ class Database:
         for k, v in defaults.items():
             self.conn.execute(
                 "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v)
+            )
+        for ext in APP_FORMATS:
+            for feature in RESULT_FEATURES:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                    (f"feature_{ext[1:]}_{feature}", "1")
+                )
+        for proto in OUTPUT_PROTOCOLS:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                (f"output_{proto}", "1")
             )
         self.conn.commit()
 
@@ -746,6 +757,23 @@ def app_output_protocol_enabled(proto):
     return DB.setting(key, "1") == "1"
 
 
+RESULT_FEATURES = {
+    "links": "🔗 لینک‌ها",
+    "json": "📋 JSON / Xray",
+    "files": "📦 فایل‌های خروجی",
+    "raw": "🧾 خروجی خام",
+    "keys": "🔑 کلیدها",
+    "info": "🔍 اطلاعات",
+    "original": "📄 فایل اصلی",
+}
+
+def result_feature_enabled(ext, feature):
+    ext = str(ext or "").lower()
+    # Text/link jobs are not app-format files; keep all standard result features available.
+    if ext not in APP_FORMATS:
+        return True
+    return DB.setting(f"feature_{ext[1:]}_{feature}", "1") == "1"
+
 def extract_links(text):
     """Extract only genuine supported URI schemes; never UUID/IP/host text."""
     found, seen = [], set()
@@ -810,6 +838,161 @@ def collect_engine_outputs(output_dir):
     return items
 
 
+
+def _b64_json(payload):
+    try:
+        raw=str(payload).strip()+"="*(-len(str(payload).strip())%4)
+        return json.loads(base64.urlsafe_b64decode(raw).decode())
+    except Exception:
+        return None
+
+def _uri_parts(uri):
+    from urllib.parse import urlsplit, parse_qs, unquote
+    try:
+        u=urlsplit(normalize_link(uri))
+        q={k:(v[-1] if v else "") for k,v in parse_qs(u.query,keep_blank_values=True).items()}
+        return u.scheme.lower(),u,q,unquote(u.fragment or "")
+    except Exception:
+        return None,None,{}, ""
+
+def _make_xray_base(remarks):
+    return {
+        "remarks": str(remarks or ""),
+        "log": {"loglevel":"warning"},
+        "inbounds":[{"tag":"socks","port":10808,"protocol":"socks",
+                     "settings":{"auth":"noauth","udp":True,"userLevel":8},
+                     "sniffing":{"enabled":True,"destOverride":["http","tls"],"routeOnly":False}}],
+        "outbounds":[],
+        "dns":{"servers":["1.1.1.1"],"hosts":{
+            "domain:googleapis.cn":"googleapis.com",
+            "dns.alidns.com":["223.5.5.5","223.6.6.6","2400:3200::1","2400:3200:baba::1"],
+            "one.one.one.one":["1.1.1.1","1.0.0.1","2606:4700:4700::1111","2606:4700:4700::1001"],
+            "dot.pub":["1.12.12.12","120.53.53.53"],
+            "dns.google":["8.8.8.8","8.8.4.4","2001:4860:4860::8888","2001:4860:4860::8844"],
+            "dns.quad9.net":["9.9.9.9","149.112.112.112","2620:fe::fe","2620:fe::9"],
+            "common.dot.dns.yandex.net":["77.88.8.8","77.88.8.1","2a02:6b8::feed:0ff","2a02:6b8:0:1::feed:0ff"]}},
+        "routing":{"domainStrategy":"IPIfNonMatch","rules":[
+            {"type":"field","ip":["1.1.1.1"],"outboundTag":"proxy","port":"53"},
+            {"type":"field","ip":["223.5.5.5"],"outboundTag":"direct","port":"53"}]}
+    }
+
+def _stream(q):
+    n=(q.get("type") or "tcp").lower()
+    s=(q.get("security") or "").lower()
+    out={"network":{"http-upgrade":"httpupgrade","x-http":"xhttp"}.get(n,n)}
+    if s and s != "none": out["security"]=s
+    if n=="ws":
+        out["wsSettings"]={"path":q.get("path") or "/", "headers":{"Host":q.get("host","")}}
+    elif n in {"httpupgrade","http-upgrade"}:
+        out["httpupgradeSettings"]={"path":q.get("path") or "/","host":q.get("host") or q.get("sni") or ""}
+    elif n in {"xhttp","x-http"}:
+        out["xhttpSettings"]={"path":q.get("path") or "/","host":q.get("host") or q.get("sni") or ""}
+    elif n=="grpc":
+        out["grpcSettings"]={"serviceName":q.get("serviceName","")}
+    elif n=="tcp":
+        out["tcpSettings"]={"header":{"type":q.get("headerType","none") or "none"}}
+    if s=="tls":
+        out["tlsSettings"]={"allowInsecure":str(q.get("allowInsecure",q.get("insecure","0"))).lower() in {"1","true","yes"},
+                             "serverName":q.get("sni",q.get("serverName","")),
+                             "alpn":[x.strip() for x in q.get("alpn","").split(",") if x.strip()],
+                             "fingerprint":q.get("fp",q.get("fingerprint","")),"show":False}
+        out["tlsSettings"]={k:v for k,v in out["tlsSettings"].items() if v not in ("",[],None)}
+    elif s=="reality":
+        out["realitySettings"]={k:v for k,v in {"show":False,"fingerprint":q.get("fp","chrome"),
+                            "serverName":q.get("sni",""),"publicKey":q.get("pbk",""),"shortId":q.get("sid","")}.items() if v not in ("",None)}
+    return out
+
+def uri_to_xray(uri):
+    scheme,u,q,remark=_uri_parts(uri)
+    if not scheme or not u or not u.hostname or not u.port: return None
+    base=_make_xray_base(remark); addr=u.hostname; port=u.port
+    if scheme=="vless":
+        user={"id":u.username or "","level":8,"encryption":q.get("encryption","none")}
+        if q.get("flow"): user["flow"]=q["flow"]
+        out={"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":addr,"port":port,"users":[user]}]},
+             "streamSettings":_stream(q),"mux":{"enabled":False,"concurrency":-1,"xudpConcurrency":8,"xudpProxyUDP443":""}}
+    elif scheme=="vmess":
+        obj=_b64_json(uri.split("://",1)[1].split("#",1)[0])
+        if not isinstance(obj,dict): return None
+        addr=str(obj.get("add") or addr); port=int(obj.get("port") or port)
+        user={"id":str(obj.get("id","")),"level":8,"alterId":int(obj.get("aid",0) or 0),"security":str(obj.get("scy","auto"))}
+        qq={"type":obj.get("net","tcp"),"security":"tls" if obj.get("tls") else "",
+            "host":obj.get("host",""),"path":obj.get("path",""),"sni":obj.get("sni",""),
+            "alpn":obj.get("alpn",""),"fp":obj.get("fp","")}
+        out={"tag":"proxy","protocol":"vmess","settings":{"vnext":[{"address":addr,"port":port,"users":[user]}]},
+             "streamSettings":_stream(qq),"mux":{"enabled":False,"concurrency":-1,"xudpConcurrency":8,"xudpProxyUDP443":""}}
+    elif scheme=="trojan":
+        pw=u.username or ""
+        out={"tag":"proxy","protocol":"trojan","settings":{"servers":[{"address":addr,"port":port,"password":pw,"level":8}]},
+             "streamSettings":_stream(q),"mux":{"enabled":False,"concurrency":-1,"xudpConcurrency":8,"xudpProxyUDP443":""}}
+    elif scheme=="ss":
+        try:
+            raw=base64.urlsafe_b64decode((u.username or "")+"="*(-len(u.username or "")%4)).decode()
+            method,password=raw.split(":",1)
+        except Exception: return None
+        out={"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":addr,"port":port,"method":method,"password":password}]}}
+    else:
+        return None
+    base["outbounds"]=[out,
+        {"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"},"mux":{"enabled":False,"concurrency":8,"xudpConcurrency":8,"xudpProxyUDP443":""}},
+        {"tag":"block","protocol":"blackhole","settings":{"response":{"type":"http"}},"mux":{"enabled":False,"concurrency":8,"xudpConcurrency":8,"xudpProxyUDP443":""}}]
+    return base
+
+def xray_configs_from_links(links):
+    result=[]; seen=set()
+    for link in links:
+        cfg=uri_to_xray(link)
+        if cfg:
+            key=json.dumps(cfg,ensure_ascii=False,sort_keys=True,separators=(",",":"))
+            if key not in seen: seen.add(key); result.append(cfg)
+    return result
+
+def profile_to_uri(profile):
+    if not isinstance(profile,dict): return None
+    server=_first(profile,"server","address","Hostname","hostname","v2rHost","host")
+    port=_first(profile,"serverPort","Port","port","v2rPort")
+    uid=_first(profile,"uuid","UUID","UserID","userId","v2rUserId","id")
+    proto=str(_first(profile,"protocol","Protocol","v2rProtocol") or "").lower()
+    if not server or not port or not uid or proto not in {"vless","vmess"}: return None
+    try: port=int(port)
+    except Exception: return None
+    params=[
+        ("type",str(_first(profile,"network","net","TransferProtocol","v2rNetwork") or "tcp").lower()),
+        ("security",str(_first(profile,"security","Security","TLSType","v2rTleSecurityType") or "").lower()),
+        ("host",str(_first(profile,"Host","host","v2rHostHeader","hostHeader") or "")),
+        ("path",str(_first(profile,"Path","path","v2rHttpPath") or "")),
+        ("sni",str(_first(profile,"SNI","sni","v2rTlsSni") or "")),
+        ("alpn",str(_first(profile,"Alpn","alpn","v2rTleAlpn") or "")),
+        ("fp",str(_first(profile,"FingerPrint","fingerprint","fp","v2rTleFingerprintType") or "")),
+        ("pbk",str(_first(profile,"PublicKey","publicKey","pbk") or "")),
+        ("sid",str(_first(profile,"ShortId","shortId","sid") or "")),
+        ("flow",str(_first(profile,"Flow","flow") or "")),
+        ("allowInsecure",str(_first(profile,"TlsAllowInsecure","tlsAllowInsecure","v2rTlsAllowInsecure","allowInsecure") or "")),
+        ("encryption",str(_first(profile,"EncryptMethod","encryption","method") or "none"))]
+    params=[x for x in params if x[1] or x[0]=="encryption"]
+    uri=f"{proto}://{quote(str(uid),safe='')}@{server}:{port}?{urlencode(params)}"
+    remark=_first(profile,"Remark","remark","remarks","name","title") or ""
+    return uri+(("#"+quote(str(remark),safe="")) if remark else "")
+
+def structured_profile_uris(values):
+    found=[]; seen=set()
+    def walk(v):
+        if isinstance(v,dict):
+            keys={str(k).lower() for k in v}
+            score=sum(bool(keys & g) for g in (
+                {"server","address","host","hostname","v2rhost"},
+                {"port","serverport","v2rport"},
+                {"uuid","userid","user_id","v2ruserid","id"},
+                {"protocol","v2rprotocol","transferprotocol"}))
+            if score>=3:
+                u=profile_to_uri(v)
+                if u and u not in seen: seen.add(u); found.append(u)
+            for x in v.values(): walk(x)
+        elif isinstance(v,list):
+            for x in v: walk(x)
+    for v in values: walk(v)
+    return found
+
 def analyze_engine_output(output_dir, stdout, stderr, input_filename):
     """Build a lossless-ish result model from ALL engine outputs.
 
@@ -831,8 +1014,12 @@ def analyze_engine_output(output_dir, stdout, stderr, input_filename):
     for uri in extract_structured_uris(combined):
         if uri not in links:
             links.append(uri)
-    keys = extract_labeled_keys(combined)
     json_values = json_objects_from_text(combined)
+    for uri in structured_profile_uris(json_values):
+        proto=uri.split("://",1)[0].lower()
+        if app_output_protocol_enabled(proto) and uri not in links:
+            links.append(uri)
+    keys = extract_labeled_keys(combined)
     return {
         "input_filename": input_filename,
         "links": links,
@@ -842,6 +1029,7 @@ def analyze_engine_output(output_dir, stdout, stderr, input_filename):
         "stderr": stderr or "",
         "files": files,
         "json_values": json_values,
+        "xray_configs": xray_configs_from_links(links),
         "protocol_counts": protocol_counts(links),
     }
 
@@ -933,11 +1121,22 @@ def user_menu():
 
 def result_menu(user_id):
     job = USER_JOBS.get(user_id, {})
+    ext = job.get("extension", Path(job.get("input_filename", "")).suffix.lower())
     rows = []
-    if job.get("links"):
+    if job.get("links") and result_feature_enabled(ext, "links"):
         rows.append([InlineKeyboardButton("🔗 لینک‌ها", callback_data=f"result:links:{user_id}", style="success")])
-    if job.get("json_values") or job.get("raw") or job.get("links"):
-        rows.append([InlineKeyboardButton("📋 JSON", callback_data=f"result:json:{user_id}", style="primary")])
+    if result_feature_enabled(ext, "json") and job.get("xray_configs"):
+        rows.append([InlineKeyboardButton("📋 JSON / Xray", callback_data=f"result:json:{user_id}", style="primary")])
+    if result_feature_enabled(ext, "keys") and job.get("keys"):
+        rows.append([InlineKeyboardButton("🔑 کلیدها", callback_data=f"result:keys:{user_id}", style="primary")])
+    if result_feature_enabled(ext, "info"):
+        rows.append([InlineKeyboardButton("🔍 اطلاعات", callback_data=f"result:info:{user_id}", style="primary")])
+    if result_feature_enabled(ext, "raw") and job.get("raw"):
+        rows.append([InlineKeyboardButton("🧾 خام", callback_data=f"result:raw:{user_id}", style="primary")])
+    if result_feature_enabled(ext, "files") and job.get("files"):
+        rows.append([InlineKeyboardButton("📦 فایل‌های خروجی", callback_data=f"result:files:{user_id}", style="success")])
+    if result_feature_enabled(ext, "original") and job.get("original_file"):
+        rows.append([InlineKeyboardButton("📄 فایل اصلی", callback_data=f"result:original:{user_id}", style="primary")])
     rows.append([InlineKeyboardButton("🗑 حذف", callback_data=f"result:delete:{user_id}", style="danger")])
     rows.extend(sponsor_rows())
     return InlineKeyboardMarkup(rows)
@@ -969,6 +1168,7 @@ def admin_menu():
             InlineKeyboardButton("⚙️ لاگ کامل موتور", callback_data="admin:engine_logs", style="primary"),
         ],
         [InlineKeyboardButton("📦 مدیریت فرمت‌های اپ", callback_data="admin:app_formats", style="primary")],
+        [InlineKeyboardButton("📡 پروتکل‌های خروجی", callback_data="admin:output_protocols", style="primary")],
         [InlineKeyboardButton("🔒 عضویت اجباری", callback_data="admin:channels", style="primary")],
     ])
 
@@ -1269,7 +1469,7 @@ async def handle_text(update, context):
 # Engine
 # ============================================================
 
-async def run_engine(input_dir, output_dir):
+async def run_engine(input_dir, output_dir, password=None):
     """Run Pantegnos completely non-interactively and wait for its real exit.
 
     We intentionally do NOT terminate the process as soon as the first output
@@ -1286,7 +1486,7 @@ async def run_engine(input_dir, output_dir):
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE if password is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(input_dir.parent),
@@ -1295,7 +1495,8 @@ async def run_engine(input_dir, output_dir):
             log.exception("engine executable not found: %s", PANTEGNOS_BIN)
             raise RuntimeError("موتور پردازش روی سرور در دسترس نیست.") from exc
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            payload = None if password is None else (str(password) + "\n").encode()
+            out, err = await asyncio.wait_for(proc.communicate(input=payload), timeout=timeout)
         except asyncio.TimeoutError as exc:
             try:
                 proc.kill()
@@ -1453,7 +1654,10 @@ async def handle_document(update, context):
                     "links": links,
                     "keys": extract_labeled_keys(content),
                     "json_values": json_objects_from_text(content),
+                    "xray_configs": xray_configs_from_links(links),
                     "files": [],
+                    "extension": ext,
+                    "original_file": None,
                     "protocol_counts": protocol_counts(links),
                     "source_files": [filename],
                 }
@@ -1509,7 +1713,17 @@ async def handle_document(update, context):
 
         rc, stdout, stderr = await run_engine(input_dir, output_dir)
 
-        # A produced output is authoritative even when the process return code is non-zero.
+        if password_prompt_detected(stdout, stderr) and not output_exists(output_dir):
+            USER_JOBS[uid] = {
+                "directory": str(work_dir), "input_dir": str(input_dir), "output_dir": str(output_dir),
+                "input_filename": filename, "extension": ext, "pending_password": True, "job_id": job_id,
+                "original_file": str(input_file), "raw": "", "links": [], "keys": [], "json_values": [],
+                "xray_configs": [], "files": [], "protocol_counts": {}, "source_files": [filename]
+            }
+            DB.finish_job(job_id, "password_required", 0, "passphrase required")
+            await status.edit_text("🔐 <b>فایل رمزگذاری شده است.</b>\n\nرمز/Passphrase را همینجا ارسال کن.", parse_mode=ParseMode.HTML)
+            return
+
         if not output_exists(output_dir):
             raise RuntimeError(engine_failure_reason(rc, stdout, stderr, ext))
 
@@ -1527,7 +1741,10 @@ async def handle_document(update, context):
             "links": analysis["links"],
             "keys": analysis["keys"],
             "json_values": analysis["json_values"],
+            "xray_configs": analysis["xray_configs"],
             "files": analysis["files"],
+            "extension": ext,
+            "original_file": str(input_file),
             "source_files": [x["name"] for x in analysis["files"]] or [filename],
             "protocol_counts": analysis["protocol_counts"],
             "job_id": job_id,
@@ -1562,68 +1779,44 @@ async def handle_document(update, context):
 
 
 async def handle_password(update, context):
-    uid = update.effective_user.id
-    job = USER_JOBS.get(uid)
-    if not job or not job.get("pending_password"):
-        return
-
-    password = update.message.text or ""
+    uid=update.effective_user.id
+    job=USER_JOBS.get(uid)
+    if not job or not job.get("pending_password"): return
+    password=update.message.text or ""
     if not password:
-        await update.message.reply_text("❌ رمز خالی قابل استفاده نیست.")
-        return
-
-    status = await update.message.reply_text("🔐 در حال بررسی رمز...")
-    output_dir = Path(job["output_dir"])
-    input_dir = Path(job["input_dir"])
-
+        await update.message.reply_text("❌ رمز خالی قابل استفاده نیست."); return
+    status=await update.message.reply_text("🔐 در حال بررسی رمز...")
+    outdir=Path(job["output_dir"]); indir=Path(job["input_dir"])
     try:
-        shutil.rmtree(output_dir, ignore_errors=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        rc, stdout, stderr = await run_engine(input_dir, output_dir, password)
-
-        if rc != 0 or not output_exists(output_dir):
+        shutil.rmtree(outdir,ignore_errors=True); outdir.mkdir(parents=True,exist_ok=True)
+        rc,stdout,stderr=await run_engine(indir,outdir,password)
+        if password_prompt_detected(stdout,stderr) and not output_exists(outdir):
             raise RuntimeError("wrong password")
-
-        raw, source_files = output_text(output_dir)
-        if not raw.strip():
+        if not output_exists(outdir):
+            raise RuntimeError(engine_failure_reason(rc,stdout,stderr,job.get("extension","")))
+        analysis=analyze_engine_output(outdir,stdout,stderr,job["input_filename"])
+        if not analysis["raw"].strip() and not analysis["links"] and not analysis["files"]:
             raise RuntimeError("empty output")
-
-        links = extract_links(raw)
-        for link in extract_structured_uris(stdout):
-            if link not in links:
-                links.append(link)
-
-        job["pending_password"] = False
-        job["raw"] = raw
-        job["links"] = links
-        job["source_files"] = source_files
-        USER_JOBS[uid] = job
-
-        DB.record_success(uid, len(links))
-        if uid != ADMIN_ID:
-            DB.captcha_increment_ops(uid)
-        DB.finish_job(job["job_id"], "success", len(links))
-
-        await status.edit_text(
-            "✅ <b>رمز صحیح بود.</b>\n\n"
-            f"🔗 لینک‌های قابل استخراج: <b>{len(links)}</b>\n\n"
-            "گزینه موردنظر را انتخاب کن:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=result_menu(uid),
-        )
-    except Exception:
-        DB.record_failure(uid)
-        DB.finish_job(job["job_id"], "failed", 0, "wrong password or invalid file")
-        DB.refund_daily(uid)
+        job.update({"pending_password":False,"raw":analysis["raw"],"stdout":analysis["stdout"],"stderr":analysis["stderr"],
+                    "links":analysis["links"],"keys":analysis["keys"],"json_values":analysis["json_values"],
+                    "xray_configs":analysis["xray_configs"],"files":analysis["files"],
+                    "source_files":[x["name"] for x in analysis["files"]] or [job["input_filename"]],
+                    "protocol_counts":analysis["protocol_counts"]})
+        USER_JOBS[uid]=job
+        DB.record_success(uid,len(analysis["links"]))
+        if uid!=ADMIN_ID: DB.captcha_increment_ops(uid)
+        DB.finish_job(job["job_id"],"success",len(analysis["links"]))
+        await status.edit_text("✅ <b>رمز صحیح بود و فایل پردازش شد.</b>\n\n"
+                                f"🔗 URIهای معتبر: <b>{len(analysis['links'])}</b>\n"
+                                f"📦 فایل‌های خروجی: <b>{len(analysis['files'])}</b>",
+                                parse_mode=ParseMode.HTML,reply_markup=result_menu(uid))
+    except Exception as exc:
+        log.warning("password processing failed user=%s: %s",uid,exc)
+        DB.record_failure(uid); DB.finish_job(job["job_id"],"failed",0,"wrong password or invalid file"); DB.refund_daily(uid)
         cleanup_job(uid)
-        await status.edit_text(
-            "❌ <b>رمز صحیح نیست یا فایل قابل پردازش نیست.</b>",
-            parse_mode=ParseMode.HTML,
-        )
+        await status.edit_text("❌ <b>رمز صحیح نیست یا فایل قابل پردازش نیست.</b>",parse_mode=ParseMode.HTML)
 
 
-# ============================================================
 # Result callback
 # ============================================================
 
@@ -1650,6 +1843,12 @@ async def result_callback(update, context):
     files = job.get("files", [])
     json_values = job.get("json_values", [])
     source_files = job.get("source_files", [])
+    xray_configs = job.get("xray_configs", [])
+    ext = job.get("extension", Path(job.get("input_filename", "")).suffix.lower())
+
+    if action in RESULT_FEATURES and not result_feature_enabled(ext, action):
+        await q.answer("این قابلیت توسط مدیر غیرفعال شده است.", show_alert=True)
+        return
 
     if action == "links":
         if not links:
@@ -1670,13 +1869,14 @@ async def result_callback(update, context):
         return
 
     if action == "json":
-        data = {
-            "links": links,
-            "configs": json_values
-        }
-        content = json.dumps(data, ensure_ascii=False, indent=2)
-        for chunk in split_text(content):
-            await q.message.reply_text(f"<pre>{esc(chunk)}</pre>", parse_mode=ParseMode.HTML, reply_markup=result_menu(owner))
+        if not xray_configs:
+            await q.message.reply_text("❌ JSON/Xray معتبر از این فایل ساخته نشد.", reply_markup=result_menu(owner))
+            return
+        for cfg in xray_configs:
+            content=json.dumps(cfg,ensure_ascii=False,separators=(",",":"))
+            for chunk in split_text(content):
+                await q.message.reply_text(f"<pre>{esc(chunk)}</pre>",parse_mode=ParseMode.HTML)
+            await q.message.reply_text("────────────",reply_markup=result_menu(owner))
         return
 
     if action == "info":
@@ -1727,6 +1927,15 @@ async def result_callback(update, context):
                 skipped += 1
                 log.warning("could not send engine output %s: %s", path, exc)
         await q.message.reply_text(f"📦 ارسال فایل‌های خروجی تمام شد. موفق: {sent} | ردشده: {skipped}", reply_markup=result_menu(owner))
+        return
+
+    if action == "original":
+        original=job.get("original_file")
+        if not original or not Path(original).exists():
+            await q.message.reply_text("❌ فایل اصلی دیگر در دسترس نیست.",reply_markup=result_menu(owner)); return
+        path=Path(original)
+        with path.open("rb") as fh:
+            await q.message.reply_document(fh,filename=path.name,caption="📄 فایل اصلی با فرمت اصلی")
         return
 
     if action == "delete":
@@ -1833,6 +2042,22 @@ async def admin_callback(update, context):
         await admin_channels(q)
     elif d == "admin:app_formats":
         await admin_app_formats(q)
+    elif d.startswith("admin:features:"):
+        await admin_features(q, "." + d.rsplit(":", 1)[1].lower())
+    elif d.startswith("admin:feature:toggle:"):
+        parts=d.split(":")
+        ext="."+parts[3].lower(); feature=parts[4]
+        if ext in APP_FORMATS and feature in RESULT_FEATURES:
+            key=f"feature_{ext[1:]}_{feature}"
+            DB.set_setting(key,"0" if result_feature_enabled(ext,feature) else "1")
+        await admin_features(q,ext)
+    elif d == "admin:output_protocols":
+        await admin_output_protocols(q)
+    elif d.startswith("admin:output:"):
+        proto=d.rsplit(":",1)[1].lower()
+        if proto in OUTPUT_PROTOCOLS:
+            DB.set_setting(f"output_{proto}","0" if app_output_protocol_enabled(proto) else "1")
+        await admin_output_protocols(q)
     elif d.startswith("admin:appfmt:toggle:"):
         ext = "." + d.rsplit(":", 1)[1].lower()
         if ext in APP_FORMATS:
@@ -1897,14 +2122,41 @@ async def admin_app_formats(q):
     for ext, meta in APP_FORMATS.items():
         enabled = app_format_enabled(ext)
         lines.append(f"{'🟢' if enabled else '⚪'} <b>{esc(meta['name'])}</b> <code>{ext}</code>")
-        rows.append([InlineKeyboardButton(
-            f"{'🟢 فعال' if enabled else '⚪ غیرفعال'} — {meta['name']}",
-            callback_data=f"admin:appfmt:toggle:{ext[1:]}",
-            style="success" if enabled else "primary",
-        )])
+        rows.append([
+            InlineKeyboardButton(f"{'🟢 فعال' if enabled else '⚪ غیرفعال'} — {meta['name']}",
+                                 callback_data=f"admin:appfmt:toggle:{ext[1:]}",
+                                 style="success" if enabled else "primary"),
+            InlineKeyboardButton("🎛 قابلیت‌ها",callback_data=f"admin:features:{ext[1:]}",style="primary")
+        ])
     rows.append([InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")])
     await q.message.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
+
+async def admin_features(q, ext):
+    if ext not in APP_FORMATS: return await admin_app_formats(q)
+    meta=APP_FORMATS[ext]
+    lines=[f"🎛 <b>قابلیت‌های {esc(meta['name'])}</b>","","هر گزینه مستقل است؛ خاموشی هم UI و هم backend را غیرفعال می‌کند.",""]
+    rows=[]
+    for feature,label in RESULT_FEATURES.items():
+        en=result_feature_enabled(ext,feature)
+        lines.append(f"{'🟢' if en else '⚪'} {label}")
+        rows.append([InlineKeyboardButton(f"{'🟢 فعال' if en else '⚪ غیرفعال'} — {label}",
+                                          callback_data=f"admin:feature:toggle:{ext[1:]}:{feature}",
+                                          style="success" if en else "primary")])
+    rows.append([InlineKeyboardButton("🔙 فرمت‌ها",callback_data="admin:app_formats",style="primary")])
+    await q.message.edit_text("\n".join(lines),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
+
+async def admin_output_protocols(q):
+    lines=["📡 <b>پروتکل‌های خروجی</b>","","فعال/غیرفعال‌کردن URI و Xray مستقل است.",""]
+    rows=[]
+    for proto in sorted(OUTPUT_PROTOCOLS):
+        en=app_output_protocol_enabled(proto)
+        lines.append(f"{'🟢' if en else '⚪'} <code>{proto}</code>")
+        rows.append([InlineKeyboardButton(f"{'🟢' if en else '⚪'} {proto}",
+                                          callback_data=f"admin:output:{proto}",
+                                          style="success" if en else "primary")])
+    rows.append([InlineKeyboardButton("🔙 پنل",callback_data="admin:dashboard",style="primary")])
+    await q.message.edit_text("\n".join(lines),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
 
 async def admin_database(q):
     exists = DB_PATH.exists()
@@ -2499,8 +2751,9 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(sponsor_style_callback, pattern=r"^sponsorstyle:"))
 
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_password), group=0)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text), group=2)
 
     app.add_error_handler(error_handler)
 
