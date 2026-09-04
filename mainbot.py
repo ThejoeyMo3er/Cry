@@ -31,11 +31,14 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ProDecryptor - single-file Telegram bot | v1.4.0
+# ProDecryptor - single-file Telegram bot | v1.5.0
 # ============================================================
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 APP_NAME = "ProDecryptor"
+RELEASE = "1.5.0"
+BUILD_DATE = "2026-09-04"
+RELEASE_NOTES = "1.5.0 — source-first profile reconstruction, exact transport preservation, clean result UI, password retry, no engine artifacts"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = 5728292317
@@ -74,6 +77,29 @@ APP_FORMATS = {
     ".happ": {"name": "HAPP", "setting": "app_happ"},
 }
 SUPPORTED_EXTENSIONS = set(APP_FORMATS)
+
+# Per-app output feature matrix.  Every result capability is independently
+# switchable for every input format. Disabled capabilities are removed from
+# the result keyboard and are also rejected server-side in callbacks.
+RESULT_FEATURES = {
+    "links": "🔗 لینک‌های کانفیگ",
+    "json": "📋 JSON استاندارد Xray",
+    "keys": "🔑 کلیدها",
+    "info": "🔍 اطلاعات پردازش",
+    "original": "📄 فایل اصلی با فرمت اصلی",
+}
+
+def feature_setting_key(ext, feature):
+    return f"feature_{str(ext).lower().lstrip('.')}__{feature}"
+
+def feature_enabled(ext, feature):
+    if feature not in RESULT_FEATURES:
+        return False
+    return DB.setting(feature_setting_key(ext, feature), "1") == "1"
+
+def enabled_features(ext):
+    return [f for f in RESULT_FEATURES if feature_enabled(ext, f)]
+
 
 # Output protocols are only for parsing genuine URI outputs.  UUIDs, IPs,
 # hostnames, server names and arbitrary text are never promoted to links.
@@ -232,21 +258,50 @@ class Database:
             "app_hat": "1",
             "app_nm": "1",
             "app_happ": "1",
+            "feature_npvt__links": "1",
+            "feature_npvt__json": "1",
+            "feature_npvt__keys": "1",
+            "feature_npvt__info": "1",
+            "feature_npvt__original": "1",
+            "feature_npvs__links": "1",
+            "feature_npvs__json": "1",
+            "feature_npvs__keys": "1",
+            "feature_npvs__info": "1",
+            "feature_npvs__original": "1",
+            "feature_slip__links": "1",
+            "feature_slip__json": "1",
+            "feature_slip__keys": "1",
+            "feature_slip__info": "1",
+            "feature_slip__original": "1",
+            "feature_dark__links": "1",
+            "feature_dark__json": "1",
+            "feature_dark__keys": "1",
+            "feature_dark__info": "1",
+            "feature_dark__original": "1",
+            "feature_ehi__links": "1",
+            "feature_ehi__json": "1",
+            "feature_ehi__keys": "1",
+            "feature_ehi__info": "1",
+            "feature_ehi__original": "1",
+            "feature_hat__links": "1",
+            "feature_hat__json": "1",
+            "feature_hat__keys": "1",
+            "feature_hat__info": "1",
+            "feature_hat__original": "1",
+            "feature_nm__links": "1",
+            "feature_nm__json": "1",
+            "feature_nm__keys": "1",
+            "feature_nm__info": "1",
+            "feature_nm__original": "1",
+            "feature_happ__links": "1",
+            "feature_happ__json": "1",
+            "feature_happ__keys": "1",
+            "feature_happ__info": "1",
+            "feature_happ__original": "1",
         }
         for k, v in defaults.items():
             self.conn.execute(
                 "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v)
-            )
-        for ext in APP_FORMATS:
-            for feature in RESULT_FEATURES:
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-                    (f"feature_{ext[1:]}_{feature}", "1")
-                )
-        for proto in OUTPUT_PROTOCOLS:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-                (f"output_{proto}", "1")
             )
         self.conn.commit()
 
@@ -639,113 +694,184 @@ def _first(d, *names):
 
 
 
-def build_vmess_from_profile(profile, remarks=None):
-    """Build standard VMess URI from V2Ray-style JSON without leaking raw config."""
-    if not isinstance(profile, dict):
-        return None
-    host = _first(profile, "v2rHost", "server", "address", "host", "add")
-    port = _first(profile, "v2rPort", "port")
-    uid = _first(profile, "v2rUserId", "uuid", "id")
-    if not host or not port or not uid:
-        return None
-    obj = {
-        "v": "2",
-        "ps": str(remarks or ""),
-        "add": str(host),
-        "port": str(port),
-        "id": str(uid),
-        "aid": str(_first(profile, "v2rAlterId", "alterId", "aid") or "0"),
-        "scy": str(_first(profile, "v2rVmessSecurity", "security", "scy") or "auto"),
-        "net": str(_first(profile, "v2rNetwork", "network", "net") or "tcp"),
-        "type": str(_first(profile, "type", "headerType") or "none"),
-        "host": str(_first(profile, "v2rHostHeader", "hostHeader") or ""),
-        "path": str(_first(profile, "v2rHttpPath", "path") or ""),
-        "tls": "tls" if str(_first(profile, "v2rTleSecurityType", "security") or "").lower() == "tls" else "",
-        "sni": str(_first(profile, "v2rTlsSni", "sni", "serverName") or ""),
-        "alpn": str(_first(profile, "v2rTleAlpn", "alpn") or ""),
-        "fp": str(_first(profile, "v2rTleFingerprintType", "fingerprint", "fp") or "")
+def _clean_remark(value):
+    value = re.sub(r"<[^>]+>", " ", str(value or ""))
+    value = html.unescape(value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value[:120]
+
+
+def _csv_list(value):
+    if value in (None, ""):
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [x.strip() for x in str(value).split(",") if x.strip()]
+
+
+def _xray_base(remark, outbound):
+    return {
+        "remarks": _clean_remark(remark) or "ProDecryptor",
+        "log": {"loglevel": "warning"},
+        "inbounds": [{"tag": "socks", "port": 10808, "protocol": "socks", "settings": {"auth": "noauth", "udp": True, "userLevel": 8}, "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False}}],
+        "outbounds": [outbound,
+            {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIP"}, "mux": {"enabled": False, "concurrency": 8, "xudpConcurrency": 8, "xudpProxyUDP443": ""}},
+            {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "http"}}, "mux": {"enabled": False, "concurrency": 8, "xudpConcurrency": 8, "xudpProxyUDP443": ""}}
+        ],
+        "dns": {"servers": ["1.1.1.1"]},
+        "routing": {"domainStrategy": "IPIfNonMatch", "rules": []},
     }
-    return "vmess://" + base64.urlsafe_b64encode(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()).decode().rstrip("=")
 
-def build_vless_from_v2ray_profile(profile, remarks=None):
-    """Conservative NPVT/NVP compatibility reconstruction only.
 
-    This is deliberately the sole protocol reconstruction in the bot. For all
-    other app-specific output, the engine's own generated URI/file/JSON is
-    preserved rather than guessed.
-    """
-    if not isinstance(profile, dict):
-        return None
-    server = _first(profile, "server", "address", "host")
-    port = _first(profile, "serverPort", "port")
-    user_id = _first(profile, "uuid", "id", "password")
-    if not server or not port or not user_id:
-        return None
-    try:
-        port = int(port)
-    except (TypeError, ValueError):
-        return None
-    query = []
-    for key, names in (
-        ("encryption", ("method", "encryption")),
-        ("type", ("network", "type")),
-        ("security", ("security",)),
-        ("sni", ("sni", "serverName")),
-        ("alpn", ("alpn",)),
-        ("fp", ("fingerPrint", "fingerprint", "fp")),
-    ):
-        value = _first(profile, *names)
-        if value is not None:
-            query.append((key, str(value)))
-    if _boolish(_first(profile, "insecure", "allowInsecure")):
-        query.extend((("insecure", "1"), ("allowInsecure", "1")))
-    uri = "vless://" + quote(str(user_id), safe="") + "@" + str(server) + ":" + str(port)
-    if query:
-        uri += "?" + urlencode(query)
-    if remarks and str(remarks).strip():
-        uri += "#" + quote(str(remarks).strip(), safe="")
+def _finish_xray(cfg):
+    cfg["dns"]["hosts"] = {
+        "domain:googleapis.cn": "googleapis.com",
+        "dns.alidns.com": ["223.5.5.5", "223.6.6.6", "2400:3200::1", "2400:3200:baba::1"],
+        "one.one.one.one": ["1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001"],
+        "dot.pub": ["1.12.12.12", "120.53.53.53"],
+        "dns.google": ["8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844"],
+        "dns.quad9.net": ["9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"],
+        "common.dot.dns.yandex.net": ["77.88.8.8", "77.88.8.1", "2a02:6b8::feed:0ff", "2a02:6b8:0:1::feed:0ff"],
+    }
+    cfg["routing"]["rules"] = [
+        {"type": "field", "ip": ["1.1.1.1"], "outboundTag": "proxy", "port": "53"},
+        {"type": "field", "ip": ["223.5.5.5"], "outboundTag": "direct", "port": "53"},
+    ]
+    return cfg
+
+
+def build_xray_config(protocol, profile, remark=None):
+    if not isinstance(profile,dict): return None
+    p=str(protocol or _first(profile,"protocol","Protocol","v2rProtocol") or "").lower()
+    address=_first(profile,"address","server","Hostname","hostname","v2rHost","add")
+    port=_first(profile,"port","Port","serverPort","v2rPort")
+    uid=_first(profile,"id","uuid","UUID","UserID","userId","v2rUserId","password")
+    if not address or not port or not uid or p not in {"vless","vmess"}: return None
+    try: port=int(port)
+    except Exception:return None
+    network=str(_first(profile,"network","net","TransferProtocol","v2rNetwork") or "tcp").lower()
+    security=str(_first(profile,"security","tls","TLSType","v2rTleSecurityType") or "").lower()
+    if security in {"none",""}: security=""
+    elif security=="ssl": security="tls"
+    user={"id":str(uid),"level":8}
+    if p=="vless":
+        user["encryption"]=str(_first(profile,"encryption","EncryptMethod","method") or "none")
+        flow=_first(profile,"flow","Flow")
+        if flow and str(flow).lower()!="none":user["flow"]=str(flow)
+    else:
+        try: aid=int(_first(profile,"alterId","AlterID","aid","v2rAlterId") or 0)
+        except Exception: aid=0
+        user["alterId"]=aid;user["security"]=str(_first(profile,"securityMethod","vmessSecurity","scy","v2rVmessSecurity") or "auto")
+    outbound={"tag":"proxy","protocol":p,"settings":{"vnext":[{"address":str(address),"port":port,"users":[user]}]}}
+    stream={"network":network}
+    if security:stream["security"]=security
+    path=str(_first(profile,"path","Path","v2rHttpPath") or "")
+    host=str(_first(profile,"host","Host","v2rHostHeader","hostHeader") or "")
+    if network=="ws":stream["wsSettings"]={"path":path or "/","headers":{"Host":host}}
+    elif network in {"httpupgrade","http-upgrade"}:
+        stream["httpupgradeSettings"]={"path":path or "/"}
+        if host:stream["httpupgradeSettings"]["host"]=host
+    elif network in {"xhttp","x-http","splithttp"}:
+        stream["xhttpSettings"]={"path":path or "/"}
+        if host:stream["xhttpSettings"]["host"]=host
+    elif network=="grpc":stream["grpcSettings"]={"serviceName":str(_first(profile,"serviceName","grpcServiceName") or "")}
+    else:stream["tcpSettings"]={"header":{"type":str(_first(profile,"headerType","FakeType","v2rTcpHeaderType") or "none")}}
+    if security=="tls":
+        t={"allowInsecure":_boolish(_first(profile,"allowInsecure","TlsAllowInsecure","v2rTlsAllowInsecure","insecure")),"serverName":str(_first(profile,"sni","SNI","serverName","v2rTlsSni") or ""),"alpn":_csv_list(_first(profile,"alpn","Alpn","v2rTleAlpn")),"fingerprint":str(_first(profile,"fingerprint","FingerPrint","fp","v2rTleFingerprintType") or ""),"show":False}
+        stream["tlsSettings"]={k:v for k,v in t.items() if v not in ("",None,[]) or k in {"allowInsecure","show"}}
+    elif security=="reality":
+        r={"show":False,"fingerprint":str(_first(profile,"fingerprint","FingerPrint","fp") or "chrome"),"serverName":str(_first(profile,"sni","SNI","serverName") or ""),"publicKey":str(_first(profile,"publicKey","PublicKey","pbk") or ""),"shortId":str(_first(profile,"shortId","ShortId","sid") or "")}
+        stream["realitySettings"]={k:v for k,v in r.items() if v not in ("",None)}
+    outbound["streamSettings"]=stream;outbound["mux"]={"enabled":False,"concurrency":-1,"xudpConcurrency":8,"xudpProxyUDP443":""}
+    return _finish_xray(_xray_base(remark,outbound))
+
+def build_vmess_from_profile(profile,remarks=None):
+    cfg=build_xray_config("vmess",profile,remarks)
+    if not cfg:return None
+    o=cfg["outbounds"][0];v=o["settings"]["vnext"][0];u=v["users"][0];ss=o["streamSettings"]
+    obj={"v":"2","ps":cfg["remarks"],"add":v["address"],"port":str(v["port"]),"id":u["id"],"aid":str(u.get("alterId",0)),"scy":u.get("security","auto"),"net":ss.get("network","tcp"),"type":"none","host":"","path":"","tls":"","sni":"","alpn":"","fp":""}
+    if obj["net"]=="ws":obj["host"]=ss.get("wsSettings",{}).get("headers",{}).get("Host","");obj["path"]=ss.get("wsSettings",{}).get("path","")
+    elif obj["net"]=="xhttp":obj["host"]=ss.get("xhttpSettings",{}).get("host","");obj["path"]=ss.get("xhttpSettings",{}).get("path","")
+    elif obj["net"]=="httpupgrade":obj["host"]=ss.get("httpupgradeSettings",{}).get("host","");obj["path"]=ss.get("httpupgradeSettings",{}).get("path","")
+    if ss.get("security")=="tls":
+        t=ss.get("tlsSettings",{});obj.update({"tls":"tls","sni":t.get("serverName",""),"alpn":",".join(t.get("alpn",[])),"fp":t.get("fingerprint","")})
+    return "vmess://"+base64.urlsafe_b64encode(json.dumps(obj,ensure_ascii=False,separators=(",",":")).encode()).decode().rstrip("=")
+
+def build_vless_from_v2ray_profile(profile,remarks=None):
+    cfg=build_xray_config("vless",profile,remarks)
+    if not cfg:return None
+    o=cfg["outbounds"][0];v=o["settings"]["vnext"][0];u=v["users"][0];ss=o["streamSettings"]
+    q=[("encryption",u.get("encryption","none")),("type",ss.get("network","tcp"))]
+    if ss.get("security"):q.append(("security",ss["security"]))
+    net=ss.get("network")
+    if net=="ws":q += [("host",ss.get("wsSettings",{}).get("headers",{}).get("Host","")),("path",ss.get("wsSettings",{}).get("path","/"))]
+    elif net=="httpupgrade":q += [("host",ss.get("httpupgradeSettings",{}).get("host","")),("path",ss.get("httpupgradeSettings",{}).get("path","/"))]
+    elif net=="xhttp":q += [("host",ss.get("xhttpSettings",{}).get("host","")),("path",ss.get("xhttpSettings",{}).get("path","/"))]
+    if ss.get("security")=="tls":
+        t=ss.get("tlsSettings",{});q += [("sni",t.get("serverName","")),("alpn",",".join(t.get("alpn",[]))), ("fp",t.get("fingerprint",""))]
+        if t.get("allowInsecure"):q.append(("allowInsecure","1"))
+    if u.get("flow"):q.append(("flow",u["flow"]))
+    uri="vless://"+quote(str(u["id"]),safe="")+"@"+str(v["address"])+":"+str(v["port"])
+    if q:uri+="?"+urlencode([(k,v) for k,v in q if v not in (None,"")])
+    if cfg["remarks"]:uri+="#"+quote(cfg["remarks"],safe="")
     return uri
 
+def _walk_profiles(value,inherited_remarks=None):
+    if isinstance(value,dict):
+        remarks=_clean_remark(_first(value,"remarks","remark","Remark","name","title","configMessage")) or inherited_remarks
+        protocol=_first(value,"protocol","Protocol","v2rProtocol")
+        if protocol and str(protocol).lower() in {"vless","vmess"}:
+            address=_first(value,"server","address","Hostname","hostname","v2rHost","add");port=_first(value,"serverPort","port","Port","v2rPort");uid=_first(value,"uuid","UUID","UserID","userId","v2rUserId","id")
+            if address and port and uid:yield str(protocol).lower(),value,remarks
+        child=value.get("v2rayProfile")
+        if isinstance(child,dict):
+            uid=_first(child,"uuid","id","password")
+            if _first(child,"server","address") and _first(child,"serverPort","port") and uid:
+                proto=str(_first(child,"protocol","Protocol") or "vless").lower();proto=proto if proto in {"vless","vmess"} else "vless"
+                yield proto,child,_clean_remark(_first(child,"remarks","remark","name")) or remarks
+        for child in value.values():
+            if isinstance(child,(dict,list)):yield from _walk_profiles(child,remarks)
+    elif isinstance(value,list):
+        for child in value:yield from _walk_profiles(child,inherited_remarks)
+
+def build_profile_outputs(json_values):
+    links=[];configs=[];seen_l=set();seen_c=set()
+    for value in json_values:
+        for proto,profile,remarks in _walk_profiles(value):
+            uri=build_vmess_from_profile(profile,remarks) if proto=="vmess" else build_vless_from_v2ray_profile(profile,remarks)
+            if uri:
+                pp=uri.split("://",1)[0].lower()
+                if pp in OUTPUT_PROTOCOLS and app_output_protocol_enabled(pp) and uri not in seen_l:seen_l.add(uri);links.append(uri)
+            cfg=build_xray_config(proto,profile,remarks)
+            if cfg:
+                key=json.dumps(cfg,ensure_ascii=False,sort_keys=True,separators=(",",":"))
+                if key not in seen_c:seen_c.add(key);configs.append(cfg)
+    return links,configs
 
 def extract_structured_uris(text):
-    """Extract engine-provided URIs and only the known NPVT structured VLESS profile."""
     found, seen = [], set()
-
     def add(uri):
         uri = normalize_link(uri)
-        if not uri or "://" not in uri:
-            return
-        proto = uri.split("://", 1)[0].lower()
-        if proto not in OUTPUT_PROTOCOLS or not app_output_protocol_enabled(proto):
-            return
-        if uri not in seen:
-            seen.add(uri)
-            found.append(uri)
-
+        if not uri or "://" not in uri: return
+        proto = uri.split("://",1)[0].lower()
+        if proto not in OUTPUT_PROTOCOLS or not app_output_protocol_enabled(proto): return
+        if uri not in seen: seen.add(uri); found.append(uri)
     def walk(value, inherited_remarks=None):
         if isinstance(value, dict):
-            remarks = _first(value, "remarks", "remark", "name", "title") or inherited_remarks
+            remarks = _clean_remark(_first(value, "remarks", "remark", "Remark", "name", "title")) or inherited_remarks
+            protocol = _first(value, "protocol", "Protocol", "v2rProtocol")
+            if protocol and _first(value, "server", "address", "Hostname", "hostname", "v2rHost", "add"):
+                if str(protocol).lower() in {"vless","vmess"}:
+                    add(build_vless_from_v2ray_profile(value, remarks) if str(protocol).lower()=="vless" else build_vmess_from_profile(value, remarks))
             for key, child in value.items():
                 if isinstance(child, str) and "://" in child:
-                    for uri in URL_RE.findall(child):
-                        add(uri)
-                if key == "v2rayProfile" and isinstance(child, dict):
-                    add(build_vmess_from_profile(child, remarks))
-                    add(build_vless_from_v2ray_profile(child, remarks))
-                    continue
-                if isinstance(child, (dict, list)):
-                    walk(child, remarks)
-            if "server" in value:
-                add(build_vmess_from_profile(value, remarks))
-                add(build_vless_from_v2ray_profile(value, remarks))
+                    for uri in URL_RE.findall(child): add(uri)
+                if key in {"v2rayProfile", "Common"} and isinstance(child, (dict,list)): walk(child, remarks)
+                elif isinstance(child, (dict,list)): walk(child, remarks)
         elif isinstance(value, list):
-            for child in value:
-                walk(child, inherited_remarks)
-
-    for value in iter_json_values(text):
-        walk(value)
+            for child in value: walk(child, inherited_remarks)
+    for value in iter_json_values(text): walk(value)
     return found
-
 
 def app_output_protocol_enabled(proto):
     # Output protocol switches are intentionally not app-format switches. Keep
@@ -756,23 +882,6 @@ def app_output_protocol_enabled(proto):
         return True
     return DB.setting(key, "1") == "1"
 
-
-RESULT_FEATURES = {
-    "links": "🔗 لینک‌ها",
-    "json": "📋 JSON / Xray",
-    "files": "📦 فایل‌های خروجی",
-    "raw": "🧾 خروجی خام",
-    "keys": "🔑 کلیدها",
-    "info": "🔍 اطلاعات",
-    "original": "📄 فایل اصلی",
-}
-
-def result_feature_enabled(ext, feature):
-    ext = str(ext or "").lower()
-    # Text/link jobs are not app-format files; keep all standard result features available.
-    if ext not in APP_FORMATS:
-        return True
-    return DB.setting(f"feature_{ext[1:]}_{feature}", "1") == "1"
 
 def extract_links(text):
     """Extract only genuine supported URI schemes; never UUID/IP/host text."""
@@ -838,201 +947,40 @@ def collect_engine_outputs(output_dir):
     return items
 
 
-
-def _b64_json(payload):
-    try:
-        raw=str(payload).strip()+"="*(-len(str(payload).strip())%4)
-        return json.loads(base64.urlsafe_b64decode(raw).decode())
-    except Exception:
-        return None
-
-def _uri_parts(uri):
-    from urllib.parse import urlsplit, parse_qs, unquote
-    try:
-        u=urlsplit(normalize_link(uri))
-        q={k:(v[-1] if v else "") for k,v in parse_qs(u.query,keep_blank_values=True).items()}
-        return u.scheme.lower(),u,q,unquote(u.fragment or "")
-    except Exception:
-        return None,None,{}, ""
-
-def _make_xray_base(remarks):
-    return {
-        "remarks": str(remarks or ""),
-        "log": {"loglevel":"warning"},
-        "inbounds":[{"tag":"socks","port":10808,"protocol":"socks",
-                     "settings":{"auth":"noauth","udp":True,"userLevel":8},
-                     "sniffing":{"enabled":True,"destOverride":["http","tls"],"routeOnly":False}}],
-        "outbounds":[],
-        "dns":{"servers":["1.1.1.1"],"hosts":{
-            "domain:googleapis.cn":"googleapis.com",
-            "dns.alidns.com":["223.5.5.5","223.6.6.6","2400:3200::1","2400:3200:baba::1"],
-            "one.one.one.one":["1.1.1.1","1.0.0.1","2606:4700:4700::1111","2606:4700:4700::1001"],
-            "dot.pub":["1.12.12.12","120.53.53.53"],
-            "dns.google":["8.8.8.8","8.8.4.4","2001:4860:4860::8888","2001:4860:4860::8844"],
-            "dns.quad9.net":["9.9.9.9","149.112.112.112","2620:fe::fe","2620:fe::9"],
-            "common.dot.dns.yandex.net":["77.88.8.8","77.88.8.1","2a02:6b8::feed:0ff","2a02:6b8:0:1::feed:0ff"]}},
-        "routing":{"domainStrategy":"IPIfNonMatch","rules":[
-            {"type":"field","ip":["1.1.1.1"],"outboundTag":"proxy","port":"53"},
-            {"type":"field","ip":["223.5.5.5"],"outboundTag":"direct","port":"53"}]}
-    }
-
-def _stream(q):
-    n=(q.get("type") or "tcp").lower()
-    s=(q.get("security") or "").lower()
-    out={"network":{"http-upgrade":"httpupgrade","x-http":"xhttp"}.get(n,n)}
-    if s and s != "none": out["security"]=s
-    if n=="ws":
-        out["wsSettings"]={"path":q.get("path") or "/", "headers":{"Host":q.get("host","")}}
-    elif n in {"httpupgrade","http-upgrade"}:
-        out["httpupgradeSettings"]={"path":q.get("path") or "/","host":q.get("host") or q.get("sni") or ""}
-    elif n in {"xhttp","x-http"}:
-        out["xhttpSettings"]={"path":q.get("path") or "/","host":q.get("host") or q.get("sni") or ""}
-    elif n=="grpc":
-        out["grpcSettings"]={"serviceName":q.get("serviceName","")}
-    elif n=="tcp":
-        out["tcpSettings"]={"header":{"type":q.get("headerType","none") or "none"}}
-    if s=="tls":
-        out["tlsSettings"]={"allowInsecure":str(q.get("allowInsecure",q.get("insecure","0"))).lower() in {"1","true","yes"},
-                             "serverName":q.get("sni",q.get("serverName","")),
-                             "alpn":[x.strip() for x in q.get("alpn","").split(",") if x.strip()],
-                             "fingerprint":q.get("fp",q.get("fingerprint","")),"show":False}
-        out["tlsSettings"]={k:v for k,v in out["tlsSettings"].items() if v not in ("",[],None)}
-    elif s=="reality":
-        out["realitySettings"]={k:v for k,v in {"show":False,"fingerprint":q.get("fp","chrome"),
-                            "serverName":q.get("sni",""),"publicKey":q.get("pbk",""),"shortId":q.get("sid","")}.items() if v not in ("",None)}
-    return out
-
-def uri_to_xray(uri):
-    scheme,u,q,remark=_uri_parts(uri)
-    if not scheme or not u or not u.hostname or not u.port: return None
-    base=_make_xray_base(remark); addr=u.hostname; port=u.port
-    if scheme=="vless":
-        user={"id":u.username or "","level":8,"encryption":q.get("encryption","none")}
-        if q.get("flow"): user["flow"]=q["flow"]
-        out={"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":addr,"port":port,"users":[user]}]},
-             "streamSettings":_stream(q),"mux":{"enabled":False,"concurrency":-1,"xudpConcurrency":8,"xudpProxyUDP443":""}}
-    elif scheme=="vmess":
-        obj=_b64_json(uri.split("://",1)[1].split("#",1)[0])
-        if not isinstance(obj,dict): return None
-        addr=str(obj.get("add") or addr); port=int(obj.get("port") or port)
-        user={"id":str(obj.get("id","")),"level":8,"alterId":int(obj.get("aid",0) or 0),"security":str(obj.get("scy","auto"))}
-        qq={"type":obj.get("net","tcp"),"security":"tls" if obj.get("tls") else "",
-            "host":obj.get("host",""),"path":obj.get("path",""),"sni":obj.get("sni",""),
-            "alpn":obj.get("alpn",""),"fp":obj.get("fp","")}
-        out={"tag":"proxy","protocol":"vmess","settings":{"vnext":[{"address":addr,"port":port,"users":[user]}]},
-             "streamSettings":_stream(qq),"mux":{"enabled":False,"concurrency":-1,"xudpConcurrency":8,"xudpProxyUDP443":""}}
-    elif scheme=="trojan":
-        pw=u.username or ""
-        out={"tag":"proxy","protocol":"trojan","settings":{"servers":[{"address":addr,"port":port,"password":pw,"level":8}]},
-             "streamSettings":_stream(q),"mux":{"enabled":False,"concurrency":-1,"xudpConcurrency":8,"xudpProxyUDP443":""}}
-    elif scheme=="ss":
+def enrich_configs_from_emitted(configs, emitted_links):
+    from urllib.parse import urlsplit, parse_qs
+    supplements=[]
+    for uri in emitted_links:
         try:
-            raw=base64.urlsafe_b64decode((u.username or "")+"="*(-len(u.username or "")%4)).decode()
-            method,password=raw.split(":",1)
-        except Exception: return None
-        out={"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":addr,"port":port,"method":method,"password":password}]}}
-    else:
-        return None
-    base["outbounds"]=[out,
-        {"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"},"mux":{"enabled":False,"concurrency":8,"xudpConcurrency":8,"xudpProxyUDP443":""}},
-        {"tag":"block","protocol":"blackhole","settings":{"response":{"type":"http"}},"mux":{"enabled":False,"concurrency":8,"xudpConcurrency":8,"xudpProxyUDP443":""}}]
-    return base
+            u=urlsplit(uri); proto=u.scheme.lower(); q={k:(v[-1] if v else "") for k,v in parse_qs(u.query,keep_blank_values=True).items()}
+            if proto=="vless":
+                supplements.append((proto,u.hostname,int(u.port or 0),u.username or "",q))
+        except Exception: continue
+    for cfg in configs:
+        try:
+            o=cfg["outbounds"][0];v=o["settings"]["vnext"][0];u=v["users"][0];ss=o.get("streamSettings",{})
+        except Exception: continue
+        for proto,addr,port,uid,q in supplements:
+            if str(addr)!=str(v.get("address")) or port!=int(v.get("port",-1)) or uid!=str(u.get("id")): continue
+            if ss.get("security")=="tls":
+                tls=ss.setdefault("tlsSettings",{})
+                if not tls.get("fingerprint") and q.get("fp"): tls["fingerprint"]=q["fp"]
+                if not tls.get("serverName") and q.get("sni"): tls["serverName"]=q["sni"]
+                if not tls.get("alpn") and q.get("alpn"): tls["alpn"]=q["alpn"].split(",")
+                if not tls.get("allowInsecure") and q.get("allowInsecure"): tls["allowInsecure"]=q["allowInsecure"].lower() in {"1","true","yes"}
+            break
+    return configs
 
-def xray_configs_from_links(links):
-    result=[]; seen=set()
-    for link in links:
-        cfg=uri_to_xray(link)
-        if cfg:
-            key=json.dumps(cfg,ensure_ascii=False,sort_keys=True,separators=(",",":"))
-            if key not in seen: seen.add(key); result.append(cfg)
-    return result
-
-def profile_to_uri(profile):
-    if not isinstance(profile,dict): return None
-    server=_first(profile,"server","address","Hostname","hostname","v2rHost","host")
-    port=_first(profile,"serverPort","Port","port","v2rPort")
-    uid=_first(profile,"uuid","UUID","UserID","userId","v2rUserId","id")
-    proto=str(_first(profile,"protocol","Protocol","v2rProtocol") or "").lower()
-    if not server or not port or not uid or proto not in {"vless","vmess"}: return None
-    try: port=int(port)
-    except Exception: return None
-    params=[
-        ("type",str(_first(profile,"network","net","TransferProtocol","v2rNetwork") or "tcp").lower()),
-        ("security",str(_first(profile,"security","Security","TLSType","v2rTleSecurityType") or "").lower()),
-        ("host",str(_first(profile,"Host","host","v2rHostHeader","hostHeader") or "")),
-        ("path",str(_first(profile,"Path","path","v2rHttpPath") or "")),
-        ("sni",str(_first(profile,"SNI","sni","v2rTlsSni") or "")),
-        ("alpn",str(_first(profile,"Alpn","alpn","v2rTleAlpn") or "")),
-        ("fp",str(_first(profile,"FingerPrint","fingerprint","fp","v2rTleFingerprintType") or "")),
-        ("pbk",str(_first(profile,"PublicKey","publicKey","pbk") or "")),
-        ("sid",str(_first(profile,"ShortId","shortId","sid") or "")),
-        ("flow",str(_first(profile,"Flow","flow") or "")),
-        ("allowInsecure",str(_first(profile,"TlsAllowInsecure","tlsAllowInsecure","v2rTlsAllowInsecure","allowInsecure") or "")),
-        ("encryption",str(_first(profile,"EncryptMethod","encryption","method") or "none"))]
-    params=[x for x in params if x[1] or x[0]=="encryption"]
-    uri=f"{proto}://{quote(str(uid),safe='')}@{server}:{port}?{urlencode(params)}"
-    remark=_first(profile,"Remark","remark","remarks","name","title") or ""
-    return uri+(("#"+quote(str(remark),safe="")) if remark else "")
-
-def structured_profile_uris(values):
-    found=[]; seen=set()
-    def walk(v):
-        if isinstance(v,dict):
-            keys={str(k).lower() for k in v}
-            score=sum(bool(keys & g) for g in (
-                {"server","address","host","hostname","v2rhost"},
-                {"port","serverport","v2rport"},
-                {"uuid","userid","user_id","v2ruserid","id"},
-                {"protocol","v2rprotocol","transferprotocol"}))
-            if score>=3:
-                u=profile_to_uri(v)
-                if u and u not in seen: seen.add(u); found.append(u)
-            for x in v.values(): walk(x)
-        elif isinstance(v,list):
-            for x in v: walk(x)
-    for v in values: walk(v)
-    return found
-
-def analyze_engine_output(output_dir, stdout, stderr, input_filename):
-    """Build a lossless-ish result model from ALL engine outputs.
-
-    Priority:
-      1) real URIs emitted by engine files/stdout
-      2) structured JSON URIs / NPVT compatibility reconstruction
-      3) explicit keys kept separate
-      4) every generated engine file exposed for download
-      5) raw text preserved verbatim for client-specific formats
-    """
-    files = collect_engine_outputs(output_dir)
-    text_parts = []
-    for item in files:
-        if item["text"] is not None:
-            text_parts.append(f"===== {item['name']} =====\n{item['text']}\n")
-    raw = "\n".join(text_parts)
-    combined = "\n".join(x for x in (stdout, stderr, raw) if x)
-    links = extract_links(combined)
-    for uri in extract_structured_uris(combined):
-        if uri not in links:
-            links.append(uri)
-    json_values = json_objects_from_text(combined)
-    for uri in structured_profile_uris(json_values):
-        proto=uri.split("://",1)[0].lower()
-        if app_output_protocol_enabled(proto) and uri not in links:
-            links.append(uri)
-    keys = extract_labeled_keys(combined)
-    return {
-        "input_filename": input_filename,
-        "links": links,
-        "keys": keys,
-        "raw": raw,
-        "stdout": stdout or "",
-        "stderr": stderr or "",
-        "files": files,
-        "json_values": json_values,
-        "xray_configs": xray_configs_from_links(links),
-        "protocol_counts": protocol_counts(links),
-    }
-
+def analyze_engine_output(output_dir,stdout,stderr,input_filename):
+    internal=collect_engine_outputs(output_dir)
+    texts=[x["text"] for x in internal if x["text"] is not None]
+    combined="\n".join(x for x in (stdout,stderr,*texts) if x)
+    json_values=json_objects_from_text(combined)
+    profile_links,profile_configs=build_profile_outputs(json_values)
+    emitted=extract_links(combined)
+    profile_configs=enrich_configs_from_emitted(profile_configs,emitted)
+    seen=set(profile_links);links=profile_links+[u for u in emitted if u not in seen]
+    return {"input_filename":input_filename,"links":links,"keys":extract_labeled_keys(combined),"raw":"","stdout":"","stderr":"","files":[],"json_values":json_values,"xray_configs":profile_configs or xray_configs_from_links(links),"protocol_counts":protocol_counts(links)}
 
 def links_codeblock(links):
     # Keep every item on its own line and preserve the code-block/copy affordance.
@@ -1120,24 +1068,20 @@ def user_menu():
 
 
 def result_menu(user_id):
-    job = USER_JOBS.get(user_id, {})
-    ext = job.get("extension", Path(job.get("input_filename", "")).suffix.lower())
-    rows = []
-    if job.get("links") and result_feature_enabled(ext, "links"):
-        rows.append([InlineKeyboardButton("🔗 لینک‌ها", callback_data=f"result:links:{user_id}", style="success")])
-    if result_feature_enabled(ext, "json") and job.get("xray_configs"):
-        rows.append([InlineKeyboardButton("📋 JSON / Xray", callback_data=f"result:json:{user_id}", style="primary")])
-    if result_feature_enabled(ext, "keys") and job.get("keys"):
-        rows.append([InlineKeyboardButton("🔑 کلیدها", callback_data=f"result:keys:{user_id}", style="primary")])
-    if result_feature_enabled(ext, "info"):
-        rows.append([InlineKeyboardButton("🔍 اطلاعات", callback_data=f"result:info:{user_id}", style="primary")])
-    if result_feature_enabled(ext, "raw") and job.get("raw"):
-        rows.append([InlineKeyboardButton("🧾 خام", callback_data=f"result:raw:{user_id}", style="primary")])
-    if result_feature_enabled(ext, "files") and job.get("files"):
-        rows.append([InlineKeyboardButton("📦 فایل‌های خروجی", callback_data=f"result:files:{user_id}", style="success")])
-    if result_feature_enabled(ext, "original") and job.get("original_file"):
-        rows.append([InlineKeyboardButton("📄 فایل اصلی", callback_data=f"result:original:{user_id}", style="primary")])
-    rows.append([InlineKeyboardButton("🗑 حذف", callback_data=f"result:delete:{user_id}", style="danger")])
+    job=USER_JOBS.get(user_id,{})
+    ext=job.get("extension",Path(job.get("input_filename","")).suffix.lower())
+    rows=[]
+    if job.get("links") and feature_enabled(ext,"links"):
+        rows.append([InlineKeyboardButton("🔗 لینک‌ها",callback_data=f"result:links:{user_id}",style="success")])
+    if job.get("xray_configs") and feature_enabled(ext,"json"):
+        rows.append([InlineKeyboardButton("📋 JSON / Xray",callback_data=f"result:json:{user_id}",style="primary")])
+    if job.get("keys") and feature_enabled(ext,"keys"):
+        rows.append([InlineKeyboardButton("🔑 کلیدها",callback_data=f"result:keys:{user_id}",style="primary")])
+    if feature_enabled(ext,"info"):
+        rows.append([InlineKeyboardButton("🔍 اطلاعات",callback_data=f"result:info:{user_id}",style="primary")])
+    if job.get("original_file") and feature_enabled(ext,"original"):
+        rows.append([InlineKeyboardButton("📄 فایل اصلی",callback_data=f"result:original:{user_id}",style="primary")])
+    rows.append([InlineKeyboardButton("🗑 حذف",callback_data=f"result:delete:{user_id}",style="danger")])
     rows.extend(sponsor_rows())
     return InlineKeyboardMarkup(rows)
 
@@ -1168,7 +1112,6 @@ def admin_menu():
             InlineKeyboardButton("⚙️ لاگ کامل موتور", callback_data="admin:engine_logs", style="primary"),
         ],
         [InlineKeyboardButton("📦 مدیریت فرمت‌های اپ", callback_data="admin:app_formats", style="primary")],
-        [InlineKeyboardButton("📡 پروتکل‌های خروجی", callback_data="admin:output_protocols", style="primary")],
         [InlineKeyboardButton("🔒 عضویت اجباری", callback_data="admin:channels", style="primary")],
     ])
 
@@ -1270,7 +1213,7 @@ async def start(update, context):
 
     limit = int(DB.setting("daily_limit", "5"))
     await update.message.reply_text(
-        "✨ <b>ProDecryptor</b>\n\n"
+        "✨ <b>ProDecryptor</b> <code>v" + APP_VERSION + "</code>\n\n"
         "فایل کانفیگ یا لینک خودت را ارسال کن.\n\n"
         f"📅 سهمیه امروز: <b>{'∞' if limit == 0 else limit}</b> فایل",
         parse_mode=ParseMode.HTML,
@@ -1419,6 +1362,9 @@ async def handle_text(update, context):
     if uid != ADMIN_ID and uid in CAPTCHA_PENDING:
         await handle_captcha_answer(update, context)
         return
+    if uid in USER_JOBS and USER_JOBS[uid].get("pending_password"):
+        await handle_password(update, context)
+        return
 
     if not await require_join(update, context):
         return
@@ -1447,11 +1393,13 @@ async def handle_text(update, context):
     cleanup_job(uid)
     USER_JOBS[uid] = {
         "directory": None,
+        "extension": "",
         "raw": update.message.text,
         "links": links,
         "source_files": ["پیام"],
         "keys": extract_labeled_keys(update.message.text or ""),
         "json_values": json_objects_from_text(update.message.text or ""),
+        "xray_configs": [],
         "files": [],
         "protocol_counts": protocol_counts(links),
     }
@@ -1481,7 +1429,7 @@ async def run_engine(input_dir, output_dir, password=None):
     timeout = max(10, int(DB.setting("process_timeout", str(DEFAULT_PROCESS_TIMEOUT))))
     command = [PANTEGNOS_BIN, "-input", str(input_dir), "-output", str(output_dir)]
     job_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    log.info("engine start input=%s output=%s interactive_password=%s", input_dir, output_dir, False)
+    log.info("engine start input=%s output=%s interactive_password=%s", input_dir, output_dir, bool(password))
     async with JOB_SEMAPHORE:
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1495,7 +1443,7 @@ async def run_engine(input_dir, output_dir, password=None):
             log.exception("engine executable not found: %s", PANTEGNOS_BIN)
             raise RuntimeError("موتور پردازش روی سرور در دسترس نیست.") from exc
         try:
-            payload = None if password is None else (str(password) + "\n").encode()
+            payload = ((str(password) + "\n").encode("utf-8") if password is not None else None)
             out, err = await asyncio.wait_for(proc.communicate(input=payload), timeout=timeout)
         except asyncio.TimeoutError as exc:
             try:
@@ -1600,6 +1548,14 @@ def engine_failure_reason(rc, stdout, stderr, ext=""):
 # File processing
 # ============================================================
 
+def result_summary_text(ext, links_count):
+    parts=["✅ <b>پردازش با موفقیت انجام شد.</b>", ""]
+    if feature_enabled(ext,"links"):
+        parts.append(f"🔗 URIهای قابل استخراج: <b>{links_count}</b>")
+    parts += ["", "گزینه‌های فعال را انتخاب کن:"]
+    return "\n".join(parts)
+
+
 async def handle_document(update, context):
     if not await guard(update):
         return
@@ -1642,21 +1598,23 @@ async def handle_document(update, context):
             tg = await doc.get_file()
             await tg.download_to_drive(custom_path=str(path))
             content = path.read_text(encoding="utf-8", errors="ignore")
-            links = extract_links(content)
+            json_values = json_objects_from_text(content)
+            profile_links, profile_configs = build_profile_outputs(json_values)
+            links = profile_links + [u for u in extract_links(content) if u not in set(profile_links)]
             if not links:
                 links = extract_structured_uris(content)
             if links:
                 cleanup_job(uid)
                 USER_JOBS[uid] = {
                     "directory": None,
+                    "extension": ext,
                     "input_filename": filename,
                     "raw": content,
                     "links": links,
                     "keys": extract_labeled_keys(content),
-                    "json_values": json_objects_from_text(content),
-                    "xray_configs": xray_configs_from_links(links),
+                    "json_values": json_values,
+                    "xray_configs": profile_configs or xray_configs_from_links(links),
                     "files": [],
-                    "extension": ext,
                     "original_file": None,
                     "protocol_counts": protocol_counts(links),
                     "source_files": [filename],
@@ -1713,39 +1671,34 @@ async def handle_document(update, context):
 
         rc, stdout, stderr = await run_engine(input_dir, output_dir)
 
-        if password_prompt_detected(stdout, stderr) and not output_exists(output_dir):
-            USER_JOBS[uid] = {
-                "directory": str(work_dir), "input_dir": str(input_dir), "output_dir": str(output_dir),
-                "input_filename": filename, "extension": ext, "pending_password": True, "job_id": job_id,
-                "original_file": str(input_file), "raw": "", "links": [], "keys": [], "json_values": [],
-                "xray_configs": [], "files": [], "protocol_counts": {}, "source_files": [filename]
-            }
-            DB.finish_job(job_id, "password_required", 0, "passphrase required")
-            await status.edit_text("🔐 <b>فایل رمزگذاری شده است.</b>\n\nرمز/Passphrase را همینجا ارسال کن.", parse_mode=ParseMode.HTML)
-            return
-
+        # A produced output is authoritative even when the process return code is non-zero.
         if not output_exists(output_dir):
+            if password_prompt_detected(stdout, stderr):
+                USER_JOBS[uid] = {"directory": str(work_dir), "input_dir": str(input_dir), "output_dir": str(output_dir), "input_filename": filename, "extension": ext, "pending_password": True, "job_id": job_id, "links": [], "keys": [], "json_values": [], "xray_configs": [], "files": [], "raw": "", "stdout": "", "stderr": "", "original_file": str(input_file)}
+                DB.finish_job(job_id, "password_required", 0, "password required")
+                await status.edit_text("🔐 <b>این فایل رمز دارد.</b>\n\nرمز فایل را در پیام بعدی ارسال کن.\nبرای لغو: /cancel", parse_mode=ParseMode.HTML)
+                return
             raise RuntimeError(engine_failure_reason(rc, stdout, stderr, ext))
 
         analysis = analyze_engine_output(output_dir, stdout, stderr, filename)
-        if not analysis["raw"].strip() and not analysis["links"] and not analysis["files"]:
+        if not analysis["links"] and not analysis["xray_configs"] and not analysis["keys"]:
             raise RuntimeError("خروجی معتبری از موتور دریافت نشد.")
-        log.info("engine analysis: files=%d links=%d json=%d keys=%d", len(analysis["files"]), len(analysis["links"]), len(analysis["json_values"]), len(analysis["keys"]))
+        log.info("engine analysis: links=%d json=%d keys=%d", len(analysis["links"]), len(analysis["json_values"]), len(analysis["keys"]))
 
         USER_JOBS[uid] = {
             "directory": str(work_dir),
+            "extension": ext,
             "input_filename": filename,
-            "raw": analysis["raw"],
-            "stdout": analysis["stdout"],
-            "stderr": analysis["stderr"],
+            "raw": "",
+            "stdout": "",
+            "stderr": "",
             "links": analysis["links"],
             "keys": analysis["keys"],
             "json_values": analysis["json_values"],
-            "xray_configs": analysis["xray_configs"],
-            "files": analysis["files"],
-            "extension": ext,
+            "xray_configs": analysis.get("xray_configs", []),
+            "files": [],
             "original_file": str(input_file),
-            "source_files": [x["name"] for x in analysis["files"]] or [filename],
+            "source_files": [filename],
             "protocol_counts": analysis["protocol_counts"],
             "job_id": job_id,
         }
@@ -1756,10 +1709,7 @@ async def handle_document(update, context):
         DB.finish_job(job_id, "success", len(analysis["links"]))
 
         await status.edit_text(
-            "✅ <b>پردازش با موفقیت انجام شد.</b>\n\n"
-            f"📄 فایل: <code>{esc(filename)}</code>\n"
-            f"🔗 URIهای قابل استخراج: <b>{len(analysis['links'])}</b>\n" f"📦 فایل‌های خروجی موتور: <b>{len(analysis['files'])}</b>\n\n"
-            "گزینه موردنظر را انتخاب کن:",
+            f"📄 فایل: <code>{esc(filename)}</code>\n\n" + result_summary_text(ext, len(analysis["links"])),
             parse_mode=ParseMode.HTML,
             reply_markup=result_menu(uid),
         )
@@ -1778,169 +1728,72 @@ async def handle_document(update, context):
         )
 
 
-async def handle_password(update, context):
-    uid=update.effective_user.id
-    job=USER_JOBS.get(uid)
-    if not job or not job.get("pending_password"): return
+async def handle_password(update,context):
+    uid=update.effective_user.id;job=USER_JOBS.get(uid)
+    if not job or not job.get("pending_password"):return
     password=update.message.text or ""
-    if not password:
-        await update.message.reply_text("❌ رمز خالی قابل استفاده نیست."); return
-    status=await update.message.reply_text("🔐 در حال بررسی رمز...")
-    outdir=Path(job["output_dir"]); indir=Path(job["input_dir"])
+    if not password:return
+    try:await update.message.delete()
+    except Exception:pass
+    status=await context.bot.send_message(uid,"🔐 در حال بررسی رمز فایل...")
+    output_dir=Path(job["output_dir"]);input_dir=Path(job["input_dir"])
     try:
-        shutil.rmtree(outdir,ignore_errors=True); outdir.mkdir(parents=True,exist_ok=True)
-        rc,stdout,stderr=await run_engine(indir,outdir,password)
-        if password_prompt_detected(stdout,stderr) and not output_exists(outdir):
-            raise RuntimeError("wrong password")
-        if not output_exists(outdir):
-            raise RuntimeError(engine_failure_reason(rc,stdout,stderr,job.get("extension","")))
-        analysis=analyze_engine_output(outdir,stdout,stderr,job["input_filename"])
-        if not analysis["raw"].strip() and not analysis["links"] and not analysis["files"]:
-            raise RuntimeError("empty output")
-        job.update({"pending_password":False,"raw":analysis["raw"],"stdout":analysis["stdout"],"stderr":analysis["stderr"],
-                    "links":analysis["links"],"keys":analysis["keys"],"json_values":analysis["json_values"],
-                    "xray_configs":analysis["xray_configs"],"files":analysis["files"],
-                    "source_files":[x["name"] for x in analysis["files"]] or [job["input_filename"]],
-                    "protocol_counts":analysis["protocol_counts"]})
-        USER_JOBS[uid]=job
-        DB.record_success(uid,len(analysis["links"]))
-        if uid!=ADMIN_ID: DB.captcha_increment_ops(uid)
-        DB.finish_job(job["job_id"],"success",len(analysis["links"]))
-        await status.edit_text("✅ <b>رمز صحیح بود و فایل پردازش شد.</b>\n\n"
-                                f"🔗 URIهای معتبر: <b>{len(analysis['links'])}</b>\n"
-                                f"📦 فایل‌های خروجی: <b>{len(analysis['files'])}</b>",
-                                parse_mode=ParseMode.HTML,reply_markup=result_menu(uid))
+        shutil.rmtree(output_dir,ignore_errors=True);output_dir.mkdir(parents=True,exist_ok=True)
+        rc,stdout,stderr=await run_engine(input_dir,output_dir,password)
+        if password_prompt_detected(stdout,stderr) and not output_exists(output_dir):raise RuntimeError("wrong password")
+        if not output_exists(output_dir):raise RuntimeError(engine_failure_reason(rc,stdout,stderr,job.get("extension","")))
+        analysis=analyze_engine_output(output_dir,stdout,stderr,job.get("input_filename","config"))
+        if not analysis["links"] and not analysis["xray_configs"] and not analysis["keys"]:raise RuntimeError("empty output")
+        job.update({"pending_password":False,"raw":"","stdout":"","stderr":"","links":analysis["links"],"keys":analysis["keys"],"json_values":analysis["json_values"],"xray_configs":analysis["xray_configs"],"files":[],"source_files":[job.get("input_filename","config")],"protocol_counts":analysis["protocol_counts"]})
+        USER_JOBS[uid]=job;DB.record_success(uid,len(analysis["links"]));DB.finish_job(job["job_id"],"success",len(analysis["links"]))
+        if uid!=ADMIN_ID:DB.captcha_increment_ops(uid)
+        await status.edit_text(result_summary_text(job.get("extension",""), len(analysis["links"])),parse_mode=ParseMode.HTML,reply_markup=result_menu(uid))
     except Exception as exc:
         log.warning("password processing failed user=%s: %s",uid,exc)
-        DB.record_failure(uid); DB.finish_job(job["job_id"],"failed",0,"wrong password or invalid file"); DB.refund_daily(uid)
-        cleanup_job(uid)
-        await status.edit_text("❌ <b>رمز صحیح نیست یا فایل قابل پردازش نیست.</b>",parse_mode=ParseMode.HTML)
+        await status.edit_text("❌ رمز صحیح نیست یا فایل قابل پردازش نیست.\n\n🔐 رمز را دوباره ارسال کن یا /cancel را بزن.",parse_mode=ParseMode.HTML)
 
 
+# ============================================================
 # Result callback
 # ============================================================
 
-async def result_callback(update, context):
-    q = update.callback_query
-    await q.answer()
-    if not await guard(update):
-        return
-    if not await require_join(update, context):
-        return
-    _, action, owner = q.data.split(":")
-    owner = int(owner)
-    if q.from_user.id != owner:
-        await q.answer("این نتیجه متعلق به شما نیست.", show_alert=True)
-        return
-    job = USER_JOBS.get(owner)
-    if not job:
-        await q.message.reply_text("⚠️ نتیجه دیگر در دسترس نیست. فایل را دوباره ارسال کن.")
-        return
-
-    links = job.get("links", [])
-    raw = job.get("raw", "")
-    keys = job.get("keys", [])
-    files = job.get("files", [])
-    json_values = job.get("json_values", [])
-    source_files = job.get("source_files", [])
-    xray_configs = job.get("xray_configs", [])
-    ext = job.get("extension", Path(job.get("input_filename", "")).suffix.lower())
-
-    if action in RESULT_FEATURES and not result_feature_enabled(ext, action):
-        await q.answer("این قابلیت توسط مدیر غیرفعال شده است.", show_alert=True)
-        return
-
-    if action == "links":
-        if not links:
-            await q.message.reply_text("❌ هیچ لینک استانداردی پیدا نشد. فقط خروجی قابل تبدیل نمایش داده می‌شود.", reply_markup=result_menu(owner))
-            return
-        for chunk_items in split_link_chunks(links):
-            await q.message.reply_text(links_codeblock(chunk_items), parse_mode=ParseMode.MARKDOWN)
-        await q.message.reply_text("🔗 پایان فهرست URIها", reply_markup=result_menu(owner))
-        return
-
-    if action == "keys":
-        if not keys:
-            await q.message.reply_text("❌ کلید صریحی در خروجی پیدا نشد.", reply_markup=result_menu(owner))
-            return
-        for chunk in split_text("\n".join(f"{i+1}. {x}" for i, x in enumerate(keys))):
-            await q.message.reply_text(f"<pre>{esc(chunk)}</pre>", parse_mode=ParseMode.HTML)
-        await q.message.reply_text("🔑 پایان کلیدها", reply_markup=result_menu(owner))
-        return
-
-    if action == "json":
-        if not xray_configs:
-            await q.message.reply_text("❌ JSON/Xray معتبر از این فایل ساخته نشد.", reply_markup=result_menu(owner))
-            return
-        for cfg in xray_configs:
-            content=json.dumps(cfg,ensure_ascii=False,separators=(",",":"))
-            for chunk in split_text(content):
-                await q.message.reply_text(f"<pre>{esc(chunk)}</pre>",parse_mode=ParseMode.HTML)
+async def result_callback(update,context):
+    q=update.callback_query;await q.answer()
+    if not await guard(update):return
+    if not await require_join(update,context):return
+    _,action,owner=q.data.split(":");owner=int(owner)
+    if q.from_user.id!=owner:await q.answer("این نتیجه متعلق به شما نیست.",show_alert=True);return
+    job=USER_JOBS.get(owner)
+    if not job:await q.message.reply_text("⚠️ نتیجه دیگر در دسترس نیست. فایل را دوباره ارسال کن.");return
+    ext=job.get("extension",Path(job.get("input_filename","")).suffix.lower())
+    if action!="delete" and not feature_enabled(ext,action):await q.answer("این قابلیت توسط مدیر غیرفعال شده است.",show_alert=True);return
+    links=job.get("links",[]);keys=job.get("keys",[]);configs=job.get("xray_configs",[])
+    if action=="links":
+        if not links:await q.message.reply_text("❌ لینک استانداردی پیدا نشد.",reply_markup=result_menu(owner));return
+        for chunk in split_link_chunks(links):await q.message.reply_text(links_codeblock(chunk),parse_mode=ParseMode.MARKDOWN)
+        await q.message.reply_text("🔗 پایان فهرست URIها",reply_markup=result_menu(owner));return
+    if action=="json":
+        if not configs:await q.message.reply_text("❌ JSON/Xray معتبر ساخته نشد.",reply_markup=result_menu(owner));return
+        for cfg in configs:
+            for chunk in split_text(json.dumps(cfg,ensure_ascii=False,separators=(",",":"))):await q.message.reply_text(f"<pre>{esc(chunk)}</pre>",parse_mode=ParseMode.HTML)
             await q.message.reply_text("────────────",reply_markup=result_menu(owner))
         return
-
-    if action == "info":
-        counts = job.get("protocol_counts", protocol_counts(links))
-        lines = [
-            "🔍 <b>اطلاعات نتیجه</b>", "",
-            f"📄 فایل‌های خروجی: <b>{len(files)}</b>",
-            f"🔗 URIهای معتبر: <b>{len(links)}</b>",
-            f"🔑 کلیدهای صریح: <b>{len(keys)}</b>",
-            f"🧩 JSONهای تشخیص‌داده‌شده: <b>{len(json_values)}</b>",
-        ]
-        if counts:
-            lines += ["", "📡 <b>پروتکل‌های URI:</b>"]
-            for p, c in sorted(counts.items()):
-                lines.append(f"• <code>{esc(p)}</code>: {c}")
-        if files:
-            lines += ["", "📦 <b>فایل‌های موتور:</b>"]
-            for x in files[:30]:
-                kind = "binary" if x["binary"] else "text"
-                lines.append(f"• <code>{esc(x['name'])}</code> — {file_size_text(x['size'])} — {kind}")
-        await q.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=result_menu(owner))
-        return
-
-    if action == "raw":
-        if not raw:
-            await q.message.reply_text("❌ خروجی متنی وجود ندارد.", reply_markup=result_menu(owner))
-            return
-        for chunk in split_text(raw):
-            await q.message.reply_text(f"<pre>{esc(chunk)}</pre>", parse_mode=ParseMode.HTML)
-        return
-
-    if action == "files":
-        if not files:
-            await q.message.reply_text("❌ فایل خروجی جداگانه‌ای وجود ندارد.", reply_markup=result_menu(owner))
-            return
-        sent = 0
-        skipped = 0
-        for item in files:
-            path = item["path"]
-            try:
-                if not path.exists() or path.stat().st_size > 49 * 1024 * 1024:
-                    skipped += 1
-                    continue
-                with path.open("rb") as f:
-                    await q.message.reply_document(f, filename=Path(item["name"]).name, caption=f"📦 خروجی موتور: {item['name']}")
-                sent += 1
-            except Exception as exc:
-                skipped += 1
-                log.warning("could not send engine output %s: %s", path, exc)
-        await q.message.reply_text(f"📦 ارسال فایل‌های خروجی تمام شد. موفق: {sent} | ردشده: {skipped}", reply_markup=result_menu(owner))
-        return
-
-    if action == "original":
+    if action=="keys":
+        if not keys:await q.message.reply_text("❌ کلید صریحی پیدا نشد.",reply_markup=result_menu(owner));return
+        for chunk in split_text("\n".join(f"{i+1}. {x}" for i,x in enumerate(keys))):await q.message.reply_text(f"<pre>{esc(chunk)}</pre>",parse_mode=ParseMode.HTML)
+        await q.message.reply_text("🔑 پایان کلیدها",reply_markup=result_menu(owner));return
+    if action=="info":
+        counts=job.get("protocol_counts",protocol_counts(links))
+        lines=["🔍 <b>اطلاعات نتیجه</b>","",f"🔗 URIهای معتبر: <b>{len(links)}</b>",f"🔑 کلیدهای صریح: <b>{len(keys)}</b>",f"🧩 JSONهای تشخیص‌داده‌شده: <b>{len(job.get('json_values',[]))}</b>"]
+        if counts:lines += ["","📡 <b>پروتکل‌های URI:</b>"]+[f"• <code>{esc(p)}</code>: {c}" for p,c in sorted(counts.items())]
+        await q.message.reply_text("\n".join(lines),parse_mode=ParseMode.HTML,reply_markup=result_menu(owner));return
+    if action=="original":
         original=job.get("original_file")
-        if not original or not Path(original).exists():
-            await q.message.reply_text("❌ فایل اصلی دیگر در دسترس نیست.",reply_markup=result_menu(owner)); return
+        if not original or not Path(original).exists():await q.message.reply_text("❌ فایل اصلی دیگر در دسترس نیست.",reply_markup=result_menu(owner));return
         path=Path(original)
-        with path.open("rb") as fh:
-            await q.message.reply_document(fh,filename=path.name,caption="📄 فایل اصلی با فرمت اصلی")
+        with path.open("rb") as fh:await q.message.reply_document(fh,filename=path.name,caption="📄 فایل اصلی با فرمت اصلی")
         return
-
-    if action == "delete":
-        cleanup_job(owner)
-        await q.message.reply_text("🗑 نتیجه حذف شد.", reply_markup=user_menu())
+    if action=="delete":cleanup_job(owner);await q.message.reply_text("🗑 نتیجه حذف شد.",reply_markup=user_menu());return
 
 
 # ============================================================
@@ -1952,7 +1805,7 @@ async def admin_command(update, context):
         return
     DB.upsert_user(update.effective_user)
     await update.message.reply_text(
-        "🛡 <b>ProDecryptor Admin</b>",
+        "🛡 <b>ProDecryptor Admin</b> <code>v" + APP_VERSION + "</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=admin_menu(),
     )
@@ -2043,21 +1896,14 @@ async def admin_callback(update, context):
     elif d == "admin:app_formats":
         await admin_app_formats(q)
     elif d.startswith("admin:features:"):
-        await admin_features(q, "." + d.rsplit(":", 1)[1].lower())
+        await admin_features(q, d.rsplit(":", 1)[1])
     elif d.startswith("admin:feature:toggle:"):
-        parts=d.split(":")
-        ext="."+parts[3].lower(); feature=parts[4]
+        _, _, _, ext, feature = d.split(":", 4)
+        ext = "." + ext.lower()
         if ext in APP_FORMATS and feature in RESULT_FEATURES:
-            key=f"feature_{ext[1:]}_{feature}"
-            DB.set_setting(key,"0" if result_feature_enabled(ext,feature) else "1")
-        await admin_features(q,ext)
-    elif d == "admin:output_protocols":
-        await admin_output_protocols(q)
-    elif d.startswith("admin:output:"):
-        proto=d.rsplit(":",1)[1].lower()
-        if proto in OUTPUT_PROTOCOLS:
-            DB.set_setting(f"output_{proto}","0" if app_output_protocol_enabled(proto) else "1")
-        await admin_output_protocols(q)
+            key = feature_setting_key(ext, feature)
+            DB.set_setting(key, "0" if feature_enabled(ext, feature) else "1")
+        await admin_features(q, ext)
     elif d.startswith("admin:appfmt:toggle:"):
         ext = "." + d.rsplit(":", 1)[1].lower()
         if ext in APP_FORMATS:
@@ -2117,46 +1963,29 @@ def back_button(callback):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=callback, style="primary")]])
 
 async def admin_app_formats(q):
-    lines = ["📦 <b>مدیریت فرمت‌های اپ</b>", "", "این بخش فقط فرمت فایل ورودی را کنترل می‌کند؛ با پروتکل‌های خروجی اشتباه نشود.", ""]
-    rows = []
+    lines = ["📦 <b>مدیریت فرمت و قابلیت‌ها</b>", "", "هر فرمت ورودی مستقل است و قابلیت‌های خروجی آن جداگانه کنترل می‌شوند.", ""]
+    rows=[]
     for ext, meta in APP_FORMATS.items():
-        enabled = app_format_enabled(ext)
+        enabled=app_format_enabled(ext)
         lines.append(f"{'🟢' if enabled else '⚪'} <b>{esc(meta['name'])}</b> <code>{ext}</code>")
-        rows.append([
-            InlineKeyboardButton(f"{'🟢 فعال' if enabled else '⚪ غیرفعال'} — {meta['name']}",
-                                 callback_data=f"admin:appfmt:toggle:{ext[1:]}",
-                                 style="success" if enabled else "primary"),
-            InlineKeyboardButton("🎛 قابلیت‌ها",callback_data=f"admin:features:{ext[1:]}",style="primary")
-        ])
+        rows.append([InlineKeyboardButton(f"{'🟢' if enabled else '⚪'} ورودی {meta['name']}", callback_data=f"admin:appfmt:toggle:{ext[1:]}", style="success" if enabled else "primary")])
+        rows.append([InlineKeyboardButton("🎛 قابلیت‌های این فرمت", callback_data=f"admin:features:{ext[1:]}", style="primary")])
     rows.append([InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")])
     await q.message.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def admin_features(q, ext):
-    if ext not in APP_FORMATS: return await admin_app_formats(q)
-    meta=APP_FORMATS[ext]
-    lines=[f"🎛 <b>قابلیت‌های {esc(meta['name'])}</b>","","هر گزینه مستقل است؛ خاموشی هم UI و هم backend را غیرفعال می‌کند.",""]
+    ext="."+ext.lower().lstrip(".")
+    if ext not in APP_FORMATS:
+        await admin_app_formats(q); return
     rows=[]
     for feature,label in RESULT_FEATURES.items():
-        en=result_feature_enabled(ext,feature)
-        lines.append(f"{'🟢' if en else '⚪'} {label}")
-        rows.append([InlineKeyboardButton(f"{'🟢 فعال' if en else '⚪ غیرفعال'} — {label}",
-                                          callback_data=f"admin:feature:toggle:{ext[1:]}:{feature}",
-                                          style="success" if en else "primary")])
-    rows.append([InlineKeyboardButton("🔙 فرمت‌ها",callback_data="admin:app_formats",style="primary")])
-    await q.message.edit_text("\n".join(lines),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
+        on=feature_enabled(ext,feature)
+        rows.append([InlineKeyboardButton(f"{'🟢' if on else '⚪'} {label}", callback_data=f"admin:feature:toggle:{ext[1:]}:{feature}", style="success" if on else "primary")])
+    rows.append([InlineKeyboardButton("🔙 فرمت‌ها", callback_data="admin:app_formats", style="primary")])
+    summary = "\n".join(("🟢 " if feature_enabled(ext,f) else "⚪ ") + RESULT_FEATURES[f] for f in RESULT_FEATURES)
+    await q.message.edit_text(f"🎛 <b>قابلیت‌های {esc(APP_FORMATS[ext]['name'])}</b>\n\n{summary}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
-async def admin_output_protocols(q):
-    lines=["📡 <b>پروتکل‌های خروجی</b>","","فعال/غیرفعال‌کردن URI و Xray مستقل است.",""]
-    rows=[]
-    for proto in sorted(OUTPUT_PROTOCOLS):
-        en=app_output_protocol_enabled(proto)
-        lines.append(f"{'🟢' if en else '⚪'} <code>{proto}</code>")
-        rows.append([InlineKeyboardButton(f"{'🟢' if en else '⚪'} {proto}",
-                                          callback_data=f"admin:output:{proto}",
-                                          style="success" if en else "primary")])
-    rows.append([InlineKeyboardButton("🔙 پنل",callback_data="admin:dashboard",style="primary")])
-    await q.message.edit_text("\n".join(lines),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
 
 async def admin_database(q):
     exists = DB_PATH.exists()
@@ -2320,7 +2149,7 @@ async def admin_status(q):
     engine = os.path.isfile(PANTEGNOS_BIN)
     await q.message.edit_text(
         "🛠 <b>وضعیت سرویس</b>\n\n"
-        f"🤖 ProDecryptor: <b>فعال</b>\n"
+        f"🤖 ProDecryptor: <b>v{APP_VERSION}</b>\n"
         f"⚙️ موتور پردازش: <b>{'آماده' if engine else 'یافت نشد'}</b>\n"
         f"💾 دیتابیس: <code>{esc(DB_PATH)}</code>\n"
         f"📦 حجم: <b>{file_size_text(int(DB.setting('max_file_size', str(DEFAULT_MAX_FILE_SIZE))) )}</b>\n"
@@ -2751,9 +2580,8 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(sponsor_style_callback, pattern=r"^sponsorstyle:"))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_password), group=0)
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document), group=1)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text), group=2)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_error_handler(error_handler)
 
